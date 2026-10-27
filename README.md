@@ -54,9 +54,14 @@ SMB 访问、容器里的下载器、定时备份、日志落盘、甚至你自�
 
 ### 方式 A：应用中心安装 .fpk（推荐）
 
-产物：`dist/diskwakemonitor_<版本>_x86.fpk`（当前为 `diskwakemonitor_1.1.0_x86.fpk`）
+安装包：
 
-文件名遵循 fnOS 规范 `{appname}_{version}_{platform}.fpk`，版本号由构建时自动带入。
+- **直接下载**：<https://github.com/xiaomilee/disk-wake-monitor/releases/latest>
+  （每个版本的 Release 附件就是安装包，按版本号选最新的）
+- **自己构建**：`bash tools/build_fpk.sh` → `dist/diskwakemonitor_<版本>_x86.fpk`
+
+文件名遵循 fnOS 规范 `{appname}_{version}_{platform}.fpk`，版本号从
+`dwm/__init__.py` 的 `__version__` 自动带入（构建时三者强校验一致）。
 `dist/` 顶层只保留当前版本，历史版本自动移到 `dist/archive/`。
 
 1. 飞牛桌面 → **应用中心** → 右上角 **设置** → **手动安装应用**
@@ -239,7 +244,7 @@ DWM_DATA_DIR=./demo-data python -m dwm serve   # 打开 http://127.0.0.1:8765/
 
 ```bash
 bash tools/build_fpk.sh
-# → dist/diskwakemonitor_1.1.0_x86.fpk
+# → dist/diskwakemonitor_<版本>_x86.fpk
 ```
 
 脚本做六件事，顺序不能省：
@@ -263,7 +268,7 @@ bash tools/build_fpk.sh
 
 收尾还有一道校验：**文件名里的版本号、包内 manifest 的 `version`、
 代码里的 `__version__` 三者必须完全一致**，任一不符即构建失败——
-避免出现「文件名写着 1.1.0、里面是旧代码」这种最难排查的情况。
+避免出现「文件名写着新版本、里面是旧代码」这种最难排查的情况。
 
 ### 版本号管理
 
@@ -284,7 +289,7 @@ bash tools/build_fpk.sh                           # 打包时自动同步 manife
 - 面板页头的版本徽标读的是 `/api/health` 的 `version`（即运行中的代码版本），
   排障时先对比它与应用中心显示的版本是否一致，不一致说明升级没有真正生效
 - 安装日志（`/var/packages/diskwakemonitor/var/install.log`）也记录了版本号
-- 产物文件名同样派生自 `__version__`（`diskwakemonitor_1.1.0_x86.fpk`），
+- 产物文件名同样派生自 `__version__`（如 `diskwakemonitor_1.2.0_x86.fpk`），
   所以 bump 之后不需要改任何构建脚本，文件名自动跟着变
 - `python tools/sync_version.py --name` 可单独查看当前版本会产出什么文件名
 
