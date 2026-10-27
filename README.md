@@ -56,7 +56,7 @@ SMB 访问、容器里的下载器、定时备份、日志落盘、甚至你自�
 
 安装包：
 
-- **直接下载**：<https://github.com/xiaomilee/disk-wake-monitor/releases/latest>
+- **直接下载**：<https://github.com/xiaomilee/diskwakemonitor/releases/latest>
   （每个版本的 Release 附件就是安装包，按版本号选最新的）
 - **自己构建**：`bash tools/build_fpk.sh` → `dist/diskwakemonitor_<版本>_x86.fpk`
 
