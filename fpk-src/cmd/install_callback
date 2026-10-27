@@ -1,0 +1,190 @@
+#!/bin/bash
+# 安装后回调：生成默认配置、按需安装辅助工具、跑一次环境自检。
+#
+# 这里只做「准备好就能用」的事，不负责启动进程（应用中心随后会调 main start）。
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+APP_ROOT="${TRIM_APPDEST:-$(dirname "$SELF_DIR")/target}"
+VAR_DIR="${TRIM_PKGVAR:-$(dirname "$SELF_DIR")/var}"
+ETC_DIR="${TRIM_PKGETC:-$(dirname "$SELF_DIR")/etc}"
+CONF="${ETC_DIR}/config.json"
+DATA_DIR="/var/lib/disk-wake-monitor"
+LOG_FILE="${VAR_DIR}/install.log"
+TEMP_LOG="${TRIM_TEMP_LOGFILE:-}"
+
+mkdir -p "$VAR_DIR" "$ETC_DIR" "$DATA_DIR" 2>/dev/null
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
+}
+
+resolve_python() {
+    local candidate
+    for candidate in \
+        /usr/bin/python3 \
+        /usr/local/bin/python3 \
+        /var/apps/python312/target/bin/python3 \
+        /var/apps/python311/target/bin/python3
+    do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    candidate="$(command -v python3 2>/dev/null)"
+    if [ -n "$candidate" ]; then
+        echo "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+PY="$(resolve_python)"
+if [ -z "$PY" ]; then
+    log_msg "ERROR: python3 not found"
+    if [ -n "$TEMP_LOG" ]; then
+        echo "硬盘唤醒归因：未找到 python3（需要 3.9 及以上）。请先安装系统 Python 后重试。" >> "$TEMP_LOG"
+    fi
+    exit 1
+fi
+log_msg "python: ${PY}"
+
+# 记下版本号，排障时一眼能对上应用中心显示的版本
+APP_VERSION="$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' \
+    "${APP_ROOT}/dwm/__init__.py" 2>/dev/null | head -n 1)"
+log_msg "app version: ${APP_VERSION:-unknown}"
+
+# ---------------------------------------------------------------- 生成配置
+wizard_install_deps="${wizard_install_deps:-true}"
+wizard_lan_access="${wizard_lan_access:-true}"
+wizard_retention_days="${wizard_retention_days:-7}"
+wizard_assume_sleep="${wizard_assume_sleep:-false}"
+export wizard_install_deps wizard_lan_access wizard_retention_days wizard_assume_sleep
+export DWM_DATA_DIR="$DATA_DIR"
+
+if [ -f "$CONF" ]; then
+    log_msg "config exists, keep it: ${CONF}"
+else
+    if "$PY" - "$CONF" <<'PYEOF' >> "$LOG_FILE" 2>&1
+import json
+import os
+import sys
+
+target = sys.argv[1]
+
+
+def flag(name, default):
+    value = os.environ.get(name, "").strip().lower()
+    if value in ("true", "1", "yes", "on"):
+        return True
+    if value in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
+def days(name, default):
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value in (7, 30, 90, 180) else default
+
+
+retention_days = days("wizard_retention_days", 7)
+lan = flag("wizard_lan_access", True)
+assume_sleep = flag("wizard_assume_sleep", False)
+
+config = {
+    "data_dir": os.environ.get("DWM_DATA_DIR", "/var/lib/disk-wake-monitor"),
+    "host": "0.0.0.0" if lan else "127.0.0.1",
+    "port": 8765,
+    "auth_token": "",
+    "retention_hours": float(retention_days) * 24.0,
+    "poll_interval": 1.0,
+    "idle_threshold_seconds": 120.0,
+    "smart_interval": 60.0,
+    "smart_enabled": True,
+    "assume_sleep_on_idle": assume_sleep,
+    "fatrace_enabled": True,
+    "blockdump_fallback": True,
+    "monitor_only_sleepable": True,
+    "monitor_devices": [],
+    "exclude_devices": [],
+    "log_level": "INFO",
+}
+
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(config, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+print("config written: %s (lan=%s, retention=%sd, assume_sleep=%s)"
+      % (target, lan, retention_days, assume_sleep))
+PYEOF
+    then
+        chmod 0640 "$CONF" 2>/dev/null
+        log_msg "config generated: ${CONF}"
+    else
+        log_msg "ERROR: failed to generate config"
+        if [ -n "$TEMP_LOG" ]; then
+            echo "硬盘唤醒归因：生成配置文件失败，请查看 ${LOG_FILE}" >> "$TEMP_LOG"
+        fi
+        exit 1
+    fi
+fi
+
+chmod 0750 "$DATA_DIR" 2>/dev/null
+
+# ---------------------------------------------------------------- 辅助工具
+case "$wizard_install_deps" in
+true | True | TRUE | 1)
+    if ! command -v fatrace >/dev/null 2>&1 || ! command -v smartctl >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            log_msg "installing fatrace + smartmontools"
+            DEBIAN_FRONTEND=noninteractive timeout 90 apt-get install -y --no-install-recommends \
+                fatrace smartmontools >> "$LOG_FILE" 2>&1
+            if [ $? -ne 0 ]; then
+                log_msg "install failed, refresh apt lists then retry"
+                DEBIAN_FRONTEND=noninteractive timeout 90 apt-get update -qq >> "$LOG_FILE" 2>&1
+                DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y --no-install-recommends \
+                    fatrace smartmontools >> "$LOG_FILE" 2>&1
+            fi
+        else
+            log_msg "apt-get not found, skip dependency install"
+        fi
+    fi
+    ;;
+*)
+    log_msg "dependency install skipped by user choice"
+    ;;
+esac
+
+for tool in fatrace smartctl; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        log_msg "${tool}: $(command -v "$tool")"
+    else
+        log_msg "${tool}: missing (采集精度会降级)"
+    fi
+done
+
+# ---------------------------------------------------------------- 环境自检
+# --quick 跳过会碰磁盘的深度探测，避免安装过程中把休眠盘叫醒
+if [ -f "${APP_ROOT}/bin/dwmctl" ]; then
+    "$PY" "${APP_ROOT}/bin/dwmctl" --config "$CONF" probe --quick \
+        > "${VAR_DIR}/probe.log" 2>&1
+    probe_rc=$?
+    log_msg "probe exit=${probe_rc}, report: ${VAR_DIR}/probe.log"
+    if [ "$probe_rc" -eq 2 ] && [ -n "$TEMP_LOG" ]; then
+        {
+            echo "安装完成，但环境自检发现阻塞项："
+            grep -E '^\s*\[✘\]|→' "${VAR_DIR}/probe.log" | head -n 6
+            echo "完整报告：${VAR_DIR}/probe.log"
+        } >> "$TEMP_LOG"
+    fi
+else
+    log_msg "WARN: ${APP_ROOT}/bin/dwmctl missing, skip probe"
+fi
+
+log_msg "install_callback done"
+exit 0

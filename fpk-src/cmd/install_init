@@ -1,0 +1,36 @@
+#!/bin/bash
+# 安装前检查：缺 Python 就直接拦下来，别让用户装完发现打不开。
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+TEMP_LOG="${TRIM_TEMP_LOGFILE:-}"
+
+fail() {
+    if [ -n "$TEMP_LOG" ]; then
+        echo "硬盘唤醒归因：$1" >> "$TEMP_LOG"
+    fi
+    exit 1
+}
+
+if [ ! -e /proc/diskstats ]; then
+    fail "系统缺少 /proc/diskstats，无法统计磁盘活动，安装中止。"
+fi
+
+PY=""
+for candidate in /usr/bin/python3 /usr/local/bin/python3 /var/apps/python312/target/bin/python3; do
+    if [ -x "$candidate" ]; then
+        PY="$candidate"
+        break
+    fi
+done
+[ -z "$PY" ] && PY="$(command -v python3 2>/dev/null)"
+
+if [ -z "$PY" ]; then
+    fail "未找到 python3（需要 3.9 及以上）。请先在系统上安装 Python 再安装本应用。"
+fi
+
+if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    fail "Python 版本过低（需要 3.9 及以上），当前 $("$PY" -V 2>&1)。"
+fi
+
+exit 0

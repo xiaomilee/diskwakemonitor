@@ -1,0 +1,38 @@
+[
+  {
+    "stepTitle": "采集设置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "保存后会<b>重启采集进程</b>使设置生效，已采集的历史数据不受影响。"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_lan_access",
+        "label": "允许局域网访问面板",
+        "initValue": "true",
+        "helpText": "开启后可用 http://NAS的IP:8765 访问（桌面图标依赖此项）；关闭则仅 NAS 本机可看。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_retention_days",
+        "label": "历史记录保留时长",
+        "initValue": "7",
+        "options": [
+          { "label": "7 天", "value": "7" },
+          { "label": "30 天", "value": "30" },
+          { "label": "90 天", "value": "90" },
+          { "label": "180 天", "value": "180" }
+        ],
+        "rules": [{ "required": true, "message": "请选择保留时长" }]
+      },
+      {
+        "type": "switch",
+        "field": "wizard_assume_sleep",
+        "label": "兼容廉价 USB 硬盘盒",
+        "initValue": "false",
+        "helpText": "打开后不再完全信任硬盘自报的电源状态，改按静默时长推断唤醒。仅在 USB 桥接盒恒报「活跃」时需要。"
+      }
+    ]
+  }
+]

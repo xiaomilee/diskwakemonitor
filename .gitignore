@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+.env
+config.json
+dist/
+.DS_Store
+demo-data/
+
+# fpk 打包中间产物（构建时由 tools/build_fpk.sh 同步而来）
+.build/
+fpk-src/app/dwm/
+fpk-src/app/web/
+fpk-src/app/bin/

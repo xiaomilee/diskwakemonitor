@@ -1,0 +1,11 @@
+[
+  {
+    "stepTitle": "更新说明",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "升级会<b>保留原有配置与全部采集历史</b>，更新完成后采集进程会自动重启到新版本，无需重新设置。<br><br>本次更新的具体条目写在应用目录下的 CHANGELOG.md；版本号可在面板页头查看。<br><br>如果升级后面板打不开，先在应用中心点一次「停止」再「启动」，然后查看 /var/packages/diskwakemonitor/var/info.log 的末尾几行。"
+      }
+    ]
+  }
+]

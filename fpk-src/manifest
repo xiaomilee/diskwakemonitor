@@ -1,0 +1,21 @@
+appname               = diskwakemonitor
+version               = 1.2.0
+display_name          = 硬盘唤醒归因
+desc                  = 记录是哪个进程访问了磁盘，查清外接硬盘被什么唤醒。<br>唤醒判定（/proc/diskstats）+ 电源态确认（SMART）+ 进程归因（fatrace），带 Web 面板与命令行。只读诊断，不修改任何数据。
+platform              = x86
+source                = thirdparty
+maintainer            = disk-wake-monitor
+distributor           = disk-wake-monitor
+os_min_version        = 0.9.0
+
+# ---- 运行控制 ----
+install_type          = root
+service_port          = 8765
+checkport             = true
+ctl_stop              = true
+
+# ---- 桌面入口 ----
+desktop_uidir         = ui
+desktop_applaunchname = diskwakemonitor.Application
+
+changelog             = 修复 fnOS 阵列挂载（/dev/md0 或 DM 挂到 /vol*）下访问事件无法归属到成员盘、导致全部唤醒「未捕获到访问事件」的问题：挂载映射现在穿透 md/DM 阵列，并新增 st_dev 兜底归属；新增按盘清除记录：面板磁盘卡片「清除」按钮、`POST /api/clear`、`dwmctl clear --dev sda`；面板新增事件产出统计：数据源显示「已接收/已归属/无法归属」事件数，事件源无产出或映射失败会直接在面板警示，不再静默；唤醒列表为空时的提示按实际故障（源无产出 / 映射失败 / 盘未休眠）区分

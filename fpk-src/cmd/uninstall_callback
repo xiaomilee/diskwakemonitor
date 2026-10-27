@@ -1,0 +1,30 @@
+#!/bin/bash
+# 卸载后：收尾清理。采集历史默认保留，避免误删取证数据。
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+DATA_DIR="/var/lib/disk-wake-monitor"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/diskwakemonitor/var}"
+LOG_FILE="${VAR_DIR}/info.log"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - uninstall: $1" >> "$LOG_FILE" 2>/dev/null
+}
+
+# 应用中心按 resource 声明会摘掉软链，这里兜底处理悬空链接
+if [ -L /usr/local/bin/dwmctl ] && [ ! -e /usr/local/bin/dwmctl ]; then
+    rm -f /usr/local/bin/dwmctl
+fi
+
+pkill -f "dwmctl --config .*config.json run" 2>/dev/null
+
+log_msg "uninstalled, data kept at ${DATA_DIR}"
+if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+    {
+        echo "硬盘唤醒归因已卸载。"
+        echo "采集历史与配置仍保留在：${DATA_DIR}"
+        echo "确认不再需要后可手动删除：sudo rm -rf ${DATA_DIR}"
+    } >> "$TRIM_TEMP_LOGFILE"
+fi
+
+exit 0

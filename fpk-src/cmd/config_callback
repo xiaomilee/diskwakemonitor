@@ -1,0 +1,113 @@
+#!/bin/bash
+# 配置变更后：把「设置」页的选项合并进 config.json，然后重启采集使配置生效。
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+APP_ROOT="${TRIM_APPDEST:-$(dirname "$SELF_DIR")/target}"
+VAR_DIR="${TRIM_PKGVAR:-$(dirname "$SELF_DIR")/var}"
+ETC_DIR="${TRIM_PKGETC:-$(dirname "$SELF_DIR")/etc}"
+CONF="${ETC_DIR}/config.json"
+LOG_FILE="${VAR_DIR}/info.log"
+TEMP_LOG="${TRIM_TEMP_LOGFILE:-}"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - config: $1" >> "$LOG_FILE" 2>/dev/null
+}
+
+resolve_python() {
+    local candidate
+    for candidate in \
+        /usr/bin/python3 \
+        /usr/local/bin/python3 \
+        /var/apps/python312/target/bin/python3 \
+        /var/apps/python311/target/bin/python3
+    do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    candidate="$(command -v python3 2>/dev/null)"
+    [ -n "$candidate" ] && echo "$candidate" && return 0
+    return 1
+}
+
+PY="$(resolve_python)"
+if [ -z "$PY" ]; then
+    log_msg "ERROR: python3 not found"
+    [ -n "$TEMP_LOG" ] && echo "硬盘唤醒归因：未找到 python3，配置未保存。" >> "$TEMP_LOG"
+    exit 1
+fi
+
+mkdir -p "$ETC_DIR" "$VAR_DIR" 2>/dev/null
+
+export wizard_lan_access="${wizard_lan_access:-}"
+export wizard_retention_days="${wizard_retention_days:-}"
+export wizard_assume_sleep="${wizard_assume_sleep:-}"
+
+if "$PY" - "$CONF" <<'PYEOF' >> "$LOG_FILE" 2>&1
+import json
+import os
+import sys
+
+target = sys.argv[1]
+changed = []
+
+try:
+    with open(target, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+except (OSError, ValueError):
+    config = {"data_dir": "/var/lib/disk-wake-monitor", "port": 8765}
+
+lan = os.environ.get("wizard_lan_access", "").strip().lower()
+if lan in ("true", "false"):
+    host = "0.0.0.0" if lan == "true" else "127.0.0.1"
+    if config.get("host") != host:
+        config["host"] = host
+        changed.append("host=%s" % host)
+
+raw_days = os.environ.get("wizard_retention_days", "").strip()
+if raw_days:
+    try:
+        days = int(raw_days)
+    except ValueError:
+        days = 0
+    if days in (7, 30, 90, 180):
+        hours = float(days) * 24.0
+        if config.get("retention_hours") != hours:
+            config["retention_hours"] = hours
+            changed.append("retention=%sd" % days)
+
+assume = os.environ.get("wizard_assume_sleep", "").strip().lower()
+if assume in ("true", "false"):
+    value = assume == "true"
+    if config.get("assume_sleep_on_idle") != value:
+        config["assume_sleep_on_idle"] = value
+        changed.append("assume_sleep_on_idle=%s" % value)
+
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(config, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+
+print("config updated: %s" % (", ".join(changed) if changed else "no change"))
+PYEOF
+then
+    log_msg "config written: ${CONF}"
+else
+    log_msg "ERROR: failed to update config"
+    [ -n "$TEMP_LOG" ] && echo "硬盘唤醒归因：写入配置失败，请查看 ${LOG_FILE}" >> "$TEMP_LOG"
+    exit 1
+fi
+
+# 重启让新配置生效（应用可能本来就是停的，stop 失败不算错误）
+bash "${SELF_DIR}/main" stop >> "$LOG_FILE" 2>&1
+sleep 1
+if bash "${SELF_DIR}/main" start >> "$LOG_FILE" 2>&1; then
+    log_msg "restarted with new config"
+    exit 0
+fi
+
+log_msg "WARN: restart failed, see ${LOG_FILE}"
+[ -n "$TEMP_LOG" ] && echo "硬盘唤醒归因：配置已保存，但重启失败，请查看应用日志。" >> "$TEMP_LOG"
+exit 0

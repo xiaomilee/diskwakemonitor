@@ -1,0 +1,11 @@
+[
+  {
+    "stepTitle": "卸载确认",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载会停止采集并移除程序，但<b>采集历史会保留</b>在 /var/lib/disk-wake-monitor。<br><br>确认不再需要时可手动删除该目录释放空间（SSH 执行：sudo rm -r /var/lib/disk-wake-monitor）。<br><br>只是想改端口、保留时长或局域网访问？不必卸载，用应用中心的「设置」即可。"
+      }
+    ]
+  }
+]

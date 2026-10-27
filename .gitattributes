@@ -1,0 +1,10 @@
+# 统一按 LF 入库。fpk-src/cmd/* 与 bin/dwmctl 是要搬到 Linux 上执行的脚本，
+# 一旦被转成 CRLF，装到 fnOS 上会报 bad interpreter: /bin/bash^M 而完全跑不起来。
+# 注意 cmd/* 没有扩展名，只能用 `* text` 兜住。
+* text=auto eol=lf
+
+# 二进制资源不做转换
+*.png binary
+*.PNG binary
+*.fpk binary
+*.db binary

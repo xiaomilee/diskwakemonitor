@@ -1,0 +1,40 @@
+[Unit]
+Description=Disk Wake Monitor - 追踪唤醒休眠硬盘的进程
+Documentation=file:/opt/disk-wake-monitor/README.md
+After=local-fs.target remote-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+# fanotify（fatrace）与 /proc/sys/vm/block_dump 都需要 root
+User=root
+Group=root
+WorkingDirectory=/opt/disk-wake-monitor
+ExecStart=/usr/bin/python3 -m dwm run
+Environment=PYTHONUNBUFFERED=1
+Environment=DWM_DATA_DIR=/var/lib/disk-wake-monitor
+
+# 崩溃自动重启，但避免疯狂重启
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# 优雅停机：给足落库与还原 block_dump 的时间
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# 轻量加固（注意不能开 ProtectSystem=strict，block_dump 需要写 /proc/sys）
+NoNewPrivileges=no
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=disk-wake-monitor
+
+[Install]
+WantedBy=multi-user.target

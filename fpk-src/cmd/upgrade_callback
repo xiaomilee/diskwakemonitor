@@ -1,0 +1,17 @@
+#!/bin/bash
+# 升级后：老配置保留，缺失则按默认值补生成；顺带重跑一次依赖检查与自检。
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# install_callback 是幂等的：配置存在就保留，工具已装就跳过，自检只读
+bash "${SELF_DIR}/install_callback"
+rc=$?
+
+# 升级会替换程序文件，把进程重启到新版本上
+bash "${SELF_DIR}/main" stop >/dev/null 2>&1
+sleep 1
+bash "${SELF_DIR}/main" start >/dev/null 2>&1
+
+exit "$rc"

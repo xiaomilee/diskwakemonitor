@@ -1,0 +1,14 @@
+#!/bin/bash
+# 卸载前：确保采集进程退出（否则删文件时 fatrace 还在抓句柄）。
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+bash "${SELF_DIR}/main" stop >/dev/null 2>&1
+sleep 1
+
+# 双保险：按命令行特征清理残留
+pkill -f "dwmctl --config .*config.json run" 2>/dev/null
+
+exit 0

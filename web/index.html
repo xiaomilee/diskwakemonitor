@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>硬盘唤醒监控</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-dot" id="liveDot" aria-hidden="true"></span>
+    <div class="brand-text">
+      <h1>硬盘唤醒监控</h1>
+      <p>disk-wake-monitor<span class="ver-chip" id="appVersion" hidden></span> · 谁把休眠盘弄醒了</p>
+    </div>
+  </div>
+
+  <div class="controls">
+    <span class="live-pill" id="livePill">
+      <span class="live-dot"></span><span id="liveText">连接中</span>
+    </span>
+    <div class="segmented" id="rangeGroup" role="group" aria-label="时间范围">
+      <button type="button" data-hours="1" data-bucket="60">1h</button>
+      <button type="button" data-hours="6" data-bucket="120">6h</button>
+      <button type="button" data-hours="24" data-bucket="300" class="active">24h</button>
+      <button type="button" data-hours="168" data-bucket="1800">7d</button>
+    </div>
+    <button type="button" class="icon-btn" id="refreshBtn" title="立即刷新" aria-label="立即刷新">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+        <path d="M13.6 8a5.6 5.6 0 1 1-1.9-4.2M13.6 2.2v3.4h-3.4"
+              fill="none" stroke="currentColor" stroke-width="1.5"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<main>
+  <section class="stats" id="stats" aria-label="概览"></section>
+
+  <section class="block" aria-labelledby="disksTitle">
+    <div class="block-head">
+      <h2 id="disksTitle">磁盘状态</h2>
+      <span class="block-hint" id="disksHint"></span>
+    </div>
+    <div class="disk-grid" id="diskGrid"></div>
+  </section>
+
+  <section class="block" aria-labelledby="timelineTitle">
+    <div class="block-head">
+      <h2 id="timelineTitle">唤醒时间线</h2>
+      <div class="legend">
+        <span><i class="lg lg-io"></i>磁盘 IO</span>
+        <span><i class="lg lg-wake"></i>唤醒</span>
+      </div>
+    </div>
+    <div class="timeline" id="timeline"></div>
+  </section>
+
+  <div class="split">
+    <section class="block" aria-labelledby="wakesTitle">
+      <div class="block-head">
+        <h2 id="wakesTitle">唤醒明细</h2>
+        <span class="block-hint">点击行展开嫌疑进程与判定说明</span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="wakeTable">
+          <thead>
+            <tr>
+              <th class="col-time">时间</th>
+              <th class="col-dev">磁盘</th>
+              <th class="col-idle">空闲时长</th>
+              <th class="col-proc">首要嫌疑</th>
+              <th class="col-conf">判定依据</th>
+            </tr>
+          </thead>
+          <tbody id="wakeBody"></tbody>
+        </table>
+        <div class="empty" id="wakeEmpty" hidden></div>
+      </div>
+    </section>
+
+    <section class="block" aria-labelledby="offendersTitle">
+      <div class="block-head">
+        <h2 id="offendersTitle">阻止休眠的元凶</h2>
+        <span class="block-hint">按访问次数排序</span>
+      </div>
+      <div class="offender-list" id="offenderList"></div>
+    </section>
+  </div>
+</main>
+
+<div class="toast-stack" id="toasts" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

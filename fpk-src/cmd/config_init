@@ -1,0 +1,4 @@
+#!/bin/bash
+# 配置变更前：占位。真正的写入在 config_callback 里做（退出码必须为 0）。
+
+exit 0

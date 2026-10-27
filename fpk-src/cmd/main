@@ -1,0 +1,199 @@
+#!/bin/bash
+# 硬盘唤醒归因（diskwakemonitor）· 启停与状态
+#
+# 应用中心调用方式：main start | main stop | main status
+#   start  成功 0 / 失败 1
+#   stop   成功 0 / 失败 1
+#   status 运行中 0 / 未运行 3
+#
+# 注意：本应用必须以 root 运行 —— fatrace(fanotify)、smartctl 电源态探测、
+# /proc/sys/vm/block_dump 都需要特权，否则只能看到「盘醒了」而看不到「谁干的」。
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+APP_NAME="diskwakemonitor"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+APP_ROOT="${TRIM_APPDEST:-$(dirname "$SELF_DIR")/target}"
+VAR_DIR="${TRIM_PKGVAR:-$(dirname "$SELF_DIR")/var}"
+ETC_DIR="${TRIM_PKGETC:-$(dirname "$SELF_DIR")/etc}"
+CONF="${ETC_DIR}/config.json"
+PID_FILE="${VAR_DIR}/app.pid"
+LOG_FILE="${VAR_DIR}/info.log"
+TEMP_LOG="${TRIM_TEMP_LOGFILE:-}"
+
+mkdir -p "$VAR_DIR" 2>/dev/null
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
+}
+
+# 错误写进 TRIM_TEMP_LOGFILE，应用中心会用对话框把它显示给用户
+fail() {
+    log_msg "ERROR: $1"
+    if [ -n "$TEMP_LOG" ]; then
+        echo "硬盘唤醒归因：$1" >> "$TEMP_LOG"
+    fi
+    return 1
+}
+
+rotate_log() {
+    local size
+    size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt 2097152 ]; then
+        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
+    fi
+}
+
+resolve_python() {
+    local candidate
+    for candidate in \
+        /usr/bin/python3 \
+        /usr/local/bin/python3 \
+        /var/apps/python312/target/bin/python3 \
+        /var/apps/python311/target/bin/python3
+    do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    candidate="$(command -v python3 2>/dev/null)"
+    if [ -n "$candidate" ]; then
+        echo "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+check_process() {
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+status() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+        if check_process "$pid"; then
+            return 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+    return 1
+}
+
+start_process() {
+    if status; then
+        log_msg "already running, skip start"
+        return 0
+    fi
+
+    local PY
+    PY="$(resolve_python)" || {
+        fail "未找到可用的 python3，无法启动。请确认系统 Python 3.9+ 存在。"
+        return 1
+    }
+
+    if [ ! -f "$CONF" ]; then
+        fail "配置文件缺失：${CONF}。请在应用中心打开「设置」保存一次以重新生成。"
+        return 1
+    fi
+    if [ ! -f "${APP_ROOT}/bin/dwmctl" ]; then
+        fail "程序文件缺失：${APP_ROOT}/bin/dwmctl。应用可能安装不完整，请重装。"
+        return 1
+    fi
+
+    rotate_log
+    log_msg "starting: ${PY} ${APP_ROOT}/bin/dwmctl --config ${CONF} run"
+
+    # setsid：让采集进程脱离本脚本的进程组，否则脚本一退出它就会被回收；
+    # 同时它成为新进程组的组长，stop 时可以用负 PID 把 fatrace 子进程一起收掉。
+    # 极简系统可能没有 setsid，退化为 nohup 后台进程（stop 时按正 PID 收）。
+    cd "$APP_ROOT" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$PY" "${APP_ROOT}/bin/dwmctl" --config "$CONF" run \
+            >> "$LOG_FILE" 2>&1 < /dev/null &
+    else
+        log_msg "setsid not found, fallback to nohup"
+        nohup "$PY" "${APP_ROOT}/bin/dwmctl" --config "$CONF" run \
+            >> "$LOG_FILE" 2>&1 < /dev/null &
+    fi
+    echo $! > "$PID_FILE"
+
+    local wait_count=0
+    while [ "$wait_count" -lt 5 ]; do
+        sleep 1
+        if status; then
+            log_msg "started pid=$(cat "$PID_FILE" 2>/dev/null)"
+            return 0
+        fi
+        wait_count=$((wait_count + 1))
+    done
+
+    rm -f "$PID_FILE"
+    fail "启动失败，5 秒内进程已退出。请查看日志：${LOG_FILE}"
+    return 1
+}
+
+stop_process() {
+    if [ ! -r "$PID_FILE" ]; then
+        log_msg "no pid file, ensure no stray process"
+        pkill -f "dwmctl --config ${CONF} run" 2>/dev/null
+        return 0
+    fi
+
+    local pid
+    pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+
+    if ! check_process "$pid"; then
+        rm -f "$PID_FILE"
+        pkill -f "dwmctl --config ${CONF} run" 2>/dev/null
+        log_msg "process not running, pid file removed"
+        return 0
+    fi
+
+    log_msg "sending TERM to process group ${pid}"
+    kill -TERM "-${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+
+    local count=0
+    while check_process "$pid" && [ "$count" -lt 15 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+
+    if check_process "$pid"; then
+        log_msg "still alive after 15s, sending KILL to group ${pid}"
+        kill -KILL "-${pid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+        sleep 1
+    fi
+
+    # 兜底：极端情况下 fatrace 可能被留成孤儿
+    pkill -f "dwmctl --config ${CONF} run" 2>/dev/null
+    rm -f "$PID_FILE"
+    log_msg "stopped"
+    return 0
+}
+
+case "$1" in
+start)
+    start_process
+    ;;
+stop)
+    stop_process
+    ;;
+status)
+    if status; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+restart)
+    stop_process
+    start_process
+    ;;
+*)
+    exit 1
+    ;;
+esac

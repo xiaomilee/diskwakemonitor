@@ -1,0 +1,4 @@
+#!/bin/bash
+# 升级前：占位。数据目录（/var/lib/disk-wake-monitor）与配置不做迁移。
+
+exit 0

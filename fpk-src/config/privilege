@@ -1,0 +1,8 @@
+{
+    "defaults":
+    {
+        "run-as": "root"
+    },
+    "username": "diskwakemonitor",
+    "groupname": "diskwakemonitor"
+}
