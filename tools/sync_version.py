@@ -92,13 +92,19 @@ def changelog_version(title: str) -> str:
     return match.group(1) if match else ""
 
 
-def compress_changelog(items: list[str], limit: int = 4) -> str:
-    """把条目压成 manifest 用的单行（fnOS 应用中心按一行显示）。"""
+def compress_changelog(items: list[str], limit: int = 2, max_chars: int = 120) -> str:
+    """把条目压成 manifest 用的单行（fnOS 应用中心按一行显示）。
+
+    应用中心那一格很窄，塞四条长条目会被截成半句话，所以只取前两条并限长。
+    """
     picked = items[:limit]
     text = "；".join(picked)
     if len(items) > limit:
         text += f" 等 {len(items)} 项"
-    return text.replace("\n", " ").replace("|", "／")
+    text = text.replace("\n", " ").replace("|", "／")
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip("；，、 ") + "…"
+    return text
 
 
 def patch_manifest(version: str, changelog: str) -> list[str]:
@@ -133,7 +139,10 @@ def patch_manifest(version: str, changelog: str) -> list[str]:
     if missing:
         raise SystemExit(f"错误：manifest 缺少字段 {', '.join(missing)}")
 
-    MANIFEST.write_text("\n".join(out) + "\n", encoding="utf-8")
+    # 必须显式 LF：Windows 默认行尾会让 manifest 的 version 带上 \r，
+    # fnOS 做版本比较时会出现看不见的尾巴
+    with open(MANIFEST, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(out) + "\n")
     return changes
 
 

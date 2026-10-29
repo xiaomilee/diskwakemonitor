@@ -550,6 +550,8 @@ _FAN_OP_MAP = (
 # 单次 read 的缓冲区。64K 在高负载（容器 + 索引）下很容易被一遍刷满，
 # 读小了会让内核队列堆积直到溢出。
 FANOTIFY_READ_SIZE = 1 << 20
+# 单个 fd 单轮最多读几次（防止一个超级块的事件风暴饿死其它超级块）
+DRAIN_BATCH = 64
 
 # fanotify_event_metadata 头部（linux/fanotify.h），当前版本固定 24 字节
 _FANOTIFY_HEADER = struct.Struct("<IBBHQii")
@@ -878,8 +880,14 @@ class FanotifySource(EventSource):
             self._close_all()
 
     def _drain(self, group: _MarkGroup) -> None:
-        """把一个 fd 的事件读干净（非阻塞，EAGAIN 即止）。"""
-        while not self._stopping.is_set():
+        """把一个 fd 的事件读干净（非阻塞，EAGAIN 即止）。
+
+        单轮最多读 DRAIN_BATCH 次就交还控制权：一次刷出几十万条事件时，
+        不能在同一个 fd 上饿死其它超级块。
+        """
+        for _ in range(DRAIN_BATCH):
+            if self._stopping.is_set():
+                return
             try:
                 data = os.read(group.fd, FANOTIFY_READ_SIZE)
             except InterruptedError:

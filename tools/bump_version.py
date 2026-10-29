@@ -45,9 +45,15 @@ def current() -> str:
     return match.group(1)
 
 
+def _write_lf(path: Path, text: str) -> None:
+    """始终写 LF：Windows 上的默认行尾会让 manifest / 脚本在 fnOS 上报错。"""
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
 def write_version(version: str) -> None:
     text = INIT_FILE.read_text(encoding="utf-8")
-    INIT_FILE.write_text(_version_re.sub(f'__version__ = "{version}"', text), encoding="utf-8")
+    _write_lf(INIT_FILE, _version_re.sub(f'__version__ = "{version}"', text))
 
 
 def prepend_changelog(version: str, summary: str) -> None:
@@ -60,7 +66,7 @@ def prepend_changelog(version: str, summary: str) -> None:
     if not match:
         raise SystemExit("错误：CHANGELOG.md 里没有 '## ' 小节，无法插入")
     index = match.start()
-    CHANGELOG.write_text(text[:index] + section + text[index:], encoding="utf-8")
+    _write_lf(CHANGELOG, text[:index] + section + text[index:])
 
 
 def main() -> int:

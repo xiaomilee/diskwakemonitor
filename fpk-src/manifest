@@ -1,7 +1,7 @@
 appname               = diskwakemonitor
 version               = 1.3.0
 display_name          = 硬盘唤醒归因
-desc                  = 记录是哪个进程访问了磁盘，查清外接硬盘被什么唤醒。<br>唤醒判定（/proc/diskstats）+ 电源态确认（SMART）+ 进程归因（fatrace），带 Web 面板与命令行。只读诊断，不修改任何数据。
+desc                  = 记录是哪个进程访问了磁盘，查清机械硬盘被什么唤醒。<br>唤醒判定（/proc/diskstats）+ 电源态确认（SMART）+ 进程归因（内建 fanotify，覆盖容器），带 Web 面板与命令行。只读诊断，不修改任何数据。
 platform              = x86
 source                = thirdparty
 maintainer            = disk-wake-monitor
@@ -18,4 +18,4 @@ ctl_stop              = true
 desktop_uidir         = ui
 desktop_applaunchname = diskwakemonitor.Application
 
-changelog             = 修复归因链路四处稳定落空：电源态键不一致、SMART 另插一条唤醒、fanotify 看不见容器、多成员盘只进第一块的环；修复电源态键：采样存的是 `/dev/sda`，diskstats 与面板查的是 `sda`，导致 `last_state` 永远 `unknown`、面板电源态恒为未知、「盘明明醒着」也拦不住；SMART 只升级最近一次 diskstats 唤醒（回看一个轮询周期），不再用采样时刻另插一条；升级后自动重跑归因并回写嫌疑进程，消除「高置信 + 零嫌疑」；归因窗口改为「唤醒前 20 秒 + 唤醒后 3 秒」，排序改为「唤醒前最早的那笔」，唤醒前 2 秒内（上电期 / 涌入期）的样本单独归类、排在后面 等 11 项
+changelog             = 修复归因链路四处稳定落空：电源态键不一致、SMART 另插一条唤醒、fanotify 看不见容器、多成员盘只进第一块的环；修复电源态键：采样存的是 `/dev/sda`，diskstats 与面板查的是 `sda`，导致 `last_st…
