@@ -157,6 +157,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         missing = [r["name"] for r in devices if not r["monitored"]]
         if missing:
             print(f"\n未监控：{', '.join(missing)}（见 dwmctl probe 的原因说明）")
+        unmounted = [
+            r["name"] for r in devices if r["monitored"] and not (r["mounts"] or "").strip()
+        ]
+        if unmounted:
+            print(
+                f"\n警告：{', '.join(unmounted)} 没有挂载点，"
+                "文件级事件无法归属（会全部落进 no_dev）。运行 dwmctl probe 查看挂载点映射。",
+                file=sys.stderr,
+            )
     finally:
         conn.close()
     return 0
@@ -189,8 +198,18 @@ def cmd_wakes(args: argparse.Namespace) -> int:
                 print("        归因：未捕获到访问事件（看 note 说明）")
             for item in items[: args.suspects]:
                 container = f" @{item['container']}" if item["container"] else ""
+                tags = []
+                keys = item.keys()
+                phase = item["phase"] if "phase" in keys else "pre"
+                if phase == "post":
+                    tags.append("唤醒后涌入")
+                elif phase == "block":
+                    tags.append("块层证据")
+                if "ambiguous" in keys and item["ambiguous"]:
+                    tags.append("多盘歧义")
+                tag = f"  [{'/'.join(tags)}]" if tags else ""
                 print(
-                    f"        ├ {item['comm']}({item['pid']}){container} "
+                    f"        ├ {item['comm']}({item['pid']}){container}{tag} "
                     f"命中 {item['hits']} 次  "
                     f"{item['sample_path'][:56] or item['cmdline'][:56]}"
                 )

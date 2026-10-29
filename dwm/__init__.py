@@ -8,4 +8,4 @@
 改版本请用 tools/bump_version.py，不要手改 manifest 的 version。
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

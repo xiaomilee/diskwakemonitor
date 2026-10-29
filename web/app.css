@@ -594,6 +594,28 @@ tr.detail > td {
   font-family: var(--mono);
 }
 
+/* 归因阶段/歧义标记：唤醒后涌入、块层证据、多盘歧义 */
+.tag-phase {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+/* 监控中的盘没有挂载点：文件级事件会全部落进 no_dev */
+.chip-warn {
+  background: var(--warn-soft);
+  border-color: transparent;
+  color: var(--warn);
+}
+
 /* ---------- 元凶排行 ---------- */
 .offender-list { padding: 4px 0; max-height: 560px; overflow: auto; }
 

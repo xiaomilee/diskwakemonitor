@@ -114,7 +114,8 @@ def _fatrace_check(cfg: Config, deep: bool) -> List[Dict[str, str]]:
             _check(
                 "fatrace",
                 "ok",
-                f"{probe['binary']}，输出格式 {probe['format']}",
+                f"{probe['binary']}，输出格式 {probe['format']}（备用源）",
+                "内建 fanotify 优先：fatrace 按挂载点打标记，看不到容器内的访问。",
             )
         ]
     return [
@@ -127,14 +128,64 @@ def _fatrace_check(cfg: Config, deep: bool) -> List[Dict[str, str]]:
     ]
 
 
-def _fanotify_check(deep: bool) -> List[Dict[str, str]]:
-    """内建 fanotify 源可用性（fatrace 缺席时的主力）。"""
+def _mounts_check(devices: List[Dict[str, Any]]) -> Dict[str, str]:
+    """被监控盘必须拿到挂载点，否则文件级事件一个都落不到它头上。"""
+    monitored = [d for d in devices if d["monitored"]]
+    if not monitored:
+        return _check("挂载点映射", "warn", "没有纳入监控的盘")
+    missing = [d["name"] for d in monitored if not d.get("mounts")]
+    if missing:
+        return _check(
+            "挂载点映射",
+            "fail",
+            f"{', '.join(missing)} 没有挂载点",
+            "这些盘上的访问事件无法归属（会全部落进 no_dev）。"
+            "确认盘已挂载；多设备 btrfs 的成员关系需要 /sys/fs/btrfs 可读",
+        )
+    detail = "；".join(f"{d['name']} → {', '.join(d['mounts'])}" for d in monitored)
+    return _check("挂载点映射", "ok", detail)
+
+
+def _fanotify_check(cfg: Config, devices: List[Dict[str, Any]], deep: bool) -> List[Dict[str, str]]:
+    """内建 fanotify 源可用性，以及能否盯住整个文件系统（容器覆盖）。"""
+    mounts = [
+        mount
+        for d in devices
+        if d["monitored"]
+        for mount in (d.get("mounts") or [])
+    ]
+    if not mounts:
+        return [
+            _check(
+                "内建fanotify",
+                "warn",
+                "被监控盘都没有挂载点，无法建立监视",
+                "fanotify 只能看到文件系统层事件；块层访问只能靠 /proc 句柄扫描",
+            )
+        ]
     if not deep:
         return [_check("内建fanotify", "ok", "将在采集时尝试（需 root）")]
-    probe = FanotifySource.probe()
-    if probe["ok"]:
-        return [_check("内建fanotify", "ok", "可用（进程级归因，无需安装任何包）")]
-    return [_check("内建fanotify", "warn", probe["error"], "确认以 root 运行")]
+
+    probe = FanotifySource.probe(mounts)
+    if not probe["ok"]:
+        return [_check("内建fanotify", "warn", probe["error"], "确认以 root 运行")]
+    if probe["filesystem"]:
+        return [
+            _check(
+                "内建fanotify",
+                "ok",
+                "可用，文件系统级标记（容器里的访问同样可见）",
+            )
+        ]
+    return [
+        _check(
+            "内建fanotify",
+            "warn",
+            "可用，但只能按挂载点标记",
+            "内核不支持 FAN_MARK_FILESYSTEM（需 4.20+）："
+            "容器 bind mount 里的访问会漏，归因可能为空",
+        )
+    ]
 
 
 def _blockdump_check(cfg: Config) -> Dict[str, str]:
@@ -217,8 +268,9 @@ def probe_environment(cfg: Config, deep: bool = True) -> Dict[str, Any]:
 
     devices, device_check = _devices_section(cfg)
     checks.append(device_check)
+    checks.append(_mounts_check(devices))
     checks.extend(_fatrace_check(cfg, deep))
-    checks.extend(_fanotify_check(deep))
+    checks.extend(_fanotify_check(cfg, devices, deep))
     checks.extend(_smart_check(cfg, deep))
     checks.append(_blockdump_check(cfg))
     checks.append(_storage_check(cfg))

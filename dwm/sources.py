@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from .errors import SourceError
 
@@ -72,6 +72,9 @@ class AccessRecord:
     device_hint: str = ""  # 分区名（sdb1）或 "major:minor"
     dev: str = ""          # 归一后的整盘名，由 collector 填充
     source: str = ""
+    # 事件源自己就能确定的设备归属（如 fanotify 按超级块分组）：
+    # 容器 bind mount 里的路径可能解析不出来，但超级块一定对得上。
+    hint_devs: Tuple[str, ...] = ()
 
     def to_row(self, container: str = "") -> tuple:
         return (
@@ -245,6 +248,10 @@ class EventSource:
         self._stopping = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._process: Optional[subprocess.Popen] = None
+
+    def stats(self) -> dict:
+        """事件源自身的计数器（溢出、路径解析失败等），供面板排查。"""
+        return {}
 
     def start(self) -> None:
         self._stopping.clear()
@@ -519,6 +526,8 @@ _FAN_CLASS_NOTIF = 0x0000_0000
 
 _FAN_MARK_ADD = 0x0000_0001
 _FAN_MARK_MOUNT = 0x0000_0010
+# 整个超级块（所有挂载，含容器 bind mount）。内核 4.20+，fnOS 6.12 支持。
+_FAN_MARK_FILESYSTEM = 0x0000_0100
 
 _FAN_OPEN = 0x0000_0001
 _FAN_ACCESS = 0x0000_0002
@@ -538,6 +547,10 @@ _FAN_OP_MAP = (
     (_FAN_OPEN_EXEC, "E"),
 )
 
+# 单次 read 的缓冲区。64K 在高负载（容器 + 索引）下很容易被一遍刷满，
+# 读小了会让内核队列堆积直到溢出。
+FANOTIFY_READ_SIZE = 1 << 20
+
 # fanotify_event_metadata 头部（linux/fanotify.h），当前版本固定 24 字节
 _FANOTIFY_HEADER = struct.Struct("<IBBHQii")
 
@@ -552,12 +565,19 @@ def _fanotify_libc() -> ctypes.CDLL:
         raise SourceError(f"无法加载 libc：{exc}") from exc
 
 
-def parse_fanotify_stream(data: bytes, ts: float) -> List[AccessRecord]:
+def parse_fanotify_stream(
+    data: bytes,
+    ts: float,
+    hint_devs: Sequence[str] = (),
+    stats: Optional[dict] = None,
+) -> List[AccessRecord]:
     """解析 fanotify read() 返回的事件缓冲区（纯函数，便于单测）。
 
     FAN_CLASS_NOTIF 模式下每条事件头 24 字节，fd 可直接从 /proc/self/fd 取路径。
+    `hint_devs` 来自事件所在的超级块分组：路径解析不出来时靠它兜底。
     """
     records: List[AccessRecord] = []
+    devs = tuple(hint_devs)
     offset = 0
     total = len(data)
     while offset + _FANOTIFY_HEADER.size <= total:
@@ -567,7 +587,11 @@ def parse_fanotify_stream(data: bytes, ts: float) -> List[AccessRecord]:
         if event_len < _FANOTIFY_HEADER.size or offset + event_len > total:
             break  # 截断的尾部，留给下一次 read（正常情况下 read 返回完整事件）
         offset += event_len
-        if vers < 2 or mask & _FAN_Q_OVERFLOW:
+        if vers < 2:
+            continue
+        if mask & _FAN_Q_OVERFLOW:
+            if stats is not None:
+                stats["overflow"] = int(stats.get("overflow", 0)) + 1
             continue
         ops = "".join(letter for bit, letter in _FAN_OP_MAP if mask & bit)
         if not ops:
@@ -582,6 +606,8 @@ def parse_fanotify_stream(data: bytes, ts: float) -> List[AccessRecord]:
                 os.close(fd)
             except OSError:
                 pass
+        if not path and stats is not None:
+            stats["unresolved_path"] = int(stats.get("unresolved_path", 0)) + 1
         records.append(
             AccessRecord(
                 ts=ts,
@@ -591,28 +617,67 @@ def parse_fanotify_stream(data: bytes, ts: float) -> List[AccessRecord]:
                 path=path,
                 device_hint="",
                 source="fanotify",
+                hint_devs=devs,
             )
         )
     return records
 
 
+class _MarkGroup:
+    """一个超级块（或挂载点）对应的一组监视：独立 fanotify fd + 设备归属。"""
+
+    __slots__ = ("fd", "devs", "mounts", "mode")
+
+    def __init__(self, fd: int, devs: Tuple[str, ...], mounts: List[str], mode: str) -> None:
+        self.fd = fd
+        self.devs = devs
+        self.mounts = mounts
+        self.mode = mode
+
+
 class FanotifySource(EventSource):
+    """内建 fanotify 源。
+
+    按「超级块」分组，每组一个 fanotify fd：
+      - 用 FAN_MARK_FILESYSTEM 盯整个文件系统，容器里的 bind mount 一样覆盖
+        （内核 4.20+；fatrace 只打 FAN_MARK_MOUNT，看不见容器）
+      - 不支持时按挂载点退回 FAN_MARK_MOUNT
+      - 事件天然带设备归属，路径解析失败（容器私有挂载命名空间）不再丢事件
+    """
+
     name = "fanotify"
 
     def __init__(
         self,
         on_record: Callable[[AccessRecord], None],
         *,
-        mounts: List[str],
+        targets: Optional[Sequence[Tuple[str, Sequence[str]]]] = None,
+        mounts: Optional[Sequence[str]] = None,
+        prefer_filesystem: bool = True,
     ) -> None:
         super().__init__(on_record)
-        self.mounts = [m for m in mounts if m and m != "-"]
-        self._fd: Optional[int] = None
+        if targets is None:
+            targets = [(m, ()) for m in (mounts or [])]
+        # mount 路径 → 设备候选；同一路径可能对应多块成员盘
+        merged: dict = {}
+        for mount, devs in targets:
+            mount = (mount or "").rstrip("/") or "/"
+            if not mount or mount == "-":
+                continue
+            bucket = merged.setdefault(mount, [])
+            for dev in devs:
+                if dev and dev not in bucket:
+                    bucket.append(dev)
+        self._targets = merged
+        self.mounts = sorted(merged)
+        self.prefer_filesystem = prefer_filesystem
+        self._groups: List[_MarkGroup] = []
+        self._stats = {"overflow": 0, "unresolved_path": 0}
 
     # --- 能力探测（不建立长期监视） ---
     @staticmethod
-    def probe() -> dict:
-        result = {"ok": False, "error": ""}
+    def probe(paths: Optional[Sequence[str]] = None) -> dict:
+        result = {"ok": False, "error": "", "mark": "", "filesystem": False}
         try:
             libc = _fanotify_libc()
             init = libc.fanotify_init
@@ -631,9 +696,64 @@ class FanotifySource(EventSource):
                 f"fanotify_init 失败：{os.strerror(err_no)}（需要 root / CAP_SYS_ADMIN）"
             )
             return result
-        os.close(fd)
-        result["ok"] = True
-        return result
+        try:
+            probe_paths = [p for p in (paths or []) if p and os.path.isdir(p)]
+            probe_paths.append("/")
+            mark = libc.fanotify_mark
+            mark.restype = ctypes.c_int
+            mark.argtypes = [
+                ctypes.c_int,
+                ctypes.c_uint,
+                ctypes.c_ulonglong,
+                ctypes.c_int,
+                ctypes.c_char_p,
+            ]
+            for flags, mode in (
+                (_FAN_MARK_ADD | _FAN_MARK_FILESYSTEM, "filesystem"),
+                (_FAN_MARK_ADD | _FAN_MARK_MOUNT, "mount"),
+            ):
+                for path in probe_paths:
+                    if mark(fd, flags, _FAN_EVENT_MASK, _AT_FDCWD, path.encode()) == 0:
+                        result["ok"] = True
+                        result["mark"] = mode
+                        result["filesystem"] = mode == "filesystem"
+                        return result
+            result["error"] = (
+                f"fanotify_mark 失败：{os.strerror(ctypes.get_errno())}"
+            )
+            return result
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def stats(self) -> dict:
+        return dict(self._stats)
+
+    # --- 分组 ---
+    def _plan_groups(self) -> List[Tuple[str, Tuple[str, ...], List[str]]]:
+        """同一个 st_dev 的挂载点合并成一组：一次 mark 覆盖整个超级块。"""
+        groups: dict = {}
+        order: List[str] = []
+        for mount in sorted(self._targets):
+            try:
+                st_dev = os.stat(mount).st_dev
+            except OSError:
+                continue  # 挂载点已消失
+            key = str(st_dev)
+            if key not in groups:
+                groups[key] = {"mount": mount, "devs": [], "mounts": []}
+                order.append(key)
+            entry = groups[key]
+            entry["mounts"].append(mount)
+            for dev in self._targets.get(mount, []):
+                if dev not in entry["devs"]:
+                    entry["devs"].append(dev)
+        return [
+            (groups[key]["mount"], tuple(groups[key]["devs"]), groups[key]["mounts"])
+            for key in order
+        ]
 
     def _init_fanotify(self) -> int:
         libc = _fanotify_libc()
@@ -652,7 +772,8 @@ class FanotifySource(EventSource):
             )
         return fd
 
-    def _mark_mounts(self, fd: int) -> None:
+    @staticmethod
+    def _mark(fd: int, flags: int, path: str) -> int:
         libc = _fanotify_libc()
         mark = libc.fanotify_mark
         mark.restype = ctypes.c_int
@@ -663,78 +784,130 @@ class FanotifySource(EventSource):
             ctypes.c_int,
             ctypes.c_char_p,
         ]
-        failures = []
-        for mount in self.mounts:
-            rc = mark(
-                fd,
-                _FAN_MARK_ADD | _FAN_MARK_MOUNT,
-                _FAN_EVENT_MASK,
-                _AT_FDCWD,
-                mount.encode("utf-8"),
-            )
-            if rc != 0:
-                err_no = ctypes.get_errno()
-                failures.append(f"{mount}: {os.strerror(err_no)}")
-        if failures:
-            LOG.warning("部分挂载点 fanotify 标记失败", extra={"failed": failures})
-        if len(failures) == len(self.mounts):
-            raise SourceError(
-                "所有挂载点都无法建立 fanotify 监视",
-                hint=f"失败详情：{'; '.join(failures)}",
-            )
+        rc = mark(fd, flags, _FAN_EVENT_MASK, _AT_FDCWD, path.encode("utf-8"))
+        return rc
 
-    def _pump(self) -> None:
-        if not self.mounts:
+    def _open_group(self, mount: str, devs: Tuple[str, ...], mounts: List[str]) -> _MarkGroup:
+        fd = self._init_fanotify()
+        try:
+            failures: List[str] = []
+            if self.prefer_filesystem:
+                if self._mark(fd, _FAN_MARK_ADD | _FAN_MARK_FILESYSTEM, mount) == 0:
+                    return _MarkGroup(fd, devs, mounts, "filesystem")
+                err_no = ctypes.get_errno()
+                failures.append(f"{mount}(filesystem): {os.strerror(err_no)}")
+                LOG.debug(
+                    "FAN_MARK_FILESYSTEM 失败，退回到挂载点标记",
+                    extra={"mount": mount, "errno": err_no},
+                )
+            marked = 0
+            for path in mounts:
+                if self._mark(fd, _FAN_MARK_ADD | _FAN_MARK_MOUNT, path) == 0:
+                    marked += 1
+                else:
+                    failures.append(f"{path}(mount): {os.strerror(ctypes.get_errno())}")
+            if marked == 0:
+                raise SourceError(
+                    "无法为挂载点建立 fanotify 监视",
+                    hint="; ".join(failures),
+                )
+            return _MarkGroup(fd, devs, mounts, "mount")
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+    def _open_all(self) -> List[_MarkGroup]:
+        if not self._targets:
             raise SourceError(
                 "没有可监视的挂载点",
                 hint="fanotify 只能看到文件系统层事件；被监控盘必须已挂载",
             )
-        fd = self._init_fanotify()
-        self._fd = fd
-        try:
-            self._mark_mounts(fd)
-        except Exception:
-            self._close_fd()
-            raise
+        plan = self._plan_groups()
+        if not plan:
+            raise SourceError(
+                "被监控盘的挂载点都不可访问",
+                hint="确认盘已挂载（dwmctl probe 可查看挂载点映射）",
+            )
+        groups: List[_MarkGroup] = []
+        failures: List[str] = []
+        for mount, devs, mounts in plan:
+            try:
+                groups.append(self._open_group(mount, devs, mounts))
+            except SourceError as exc:
+                failures.append(f"{mount}: {exc}")
+        if not groups:
+            raise SourceError(
+                "所有挂载点都无法建立 fanotify 监视",
+                hint="; ".join(failures),
+            )
+        if failures:
+            LOG.warning("部分挂载点 fanotify 标记失败", extra={"failed": failures})
+        return groups
+
+    def _pump(self) -> None:
+        groups = self._open_all()
+        self._groups = groups
         LOG.info(
             "启动事件源",
-            extra={"source": self.name, "mounts": self.mounts},
+            extra={
+                "source": self.name,
+                "groups": [
+                    {"mounts": g.mounts, "devs": list(g.devs), "mode": g.mode}
+                    for g in groups
+                ],
+            },
         )
+        by_fd = {g.fd: g for g in groups}
+        try:
+            while not self._stopping.is_set():
+                try:
+                    readable, _, _ = select.select(list(by_fd), [], [], 0.5)
+                except InterruptedError:
+                    continue
+                except (OSError, ValueError) as exc:
+                    raise SourceError(f"select fanotify fd 失败：{exc}")
+                for fd in readable:
+                    group = by_fd.get(fd)
+                    if group is None:
+                        continue
+                    self._drain(group)
+        finally:
+            self._close_all()
+
+    def _drain(self, group: _MarkGroup) -> None:
+        """把一个 fd 的事件读干净（非阻塞，EAGAIN 即止）。"""
         while not self._stopping.is_set():
             try:
-                readable, _, _ = select.select([fd], [], [], 0.5)
-            except InterruptedError:
-                continue
-            except (OSError, ValueError) as exc:
-                raise SourceError(f"select fanotify fd 失败：{exc}")
-            if not readable:
-                continue
-            try:
-                data = os.read(fd, 65536)
+                data = os.read(group.fd, FANOTIFY_READ_SIZE)
             except InterruptedError:
                 continue
             except OSError as exc:
                 if exc.errno in (errno.EINTR, errno.EAGAIN):
-                    continue
+                    return
                 raise SourceError(f"读取 fanotify 事件失败：{exc}")
             if not data:
-                continue
-            for record in parse_fanotify_stream(data, time.time()):
+                return
+            for record in parse_fanotify_stream(
+                data, time.time(), hint_devs=group.devs, stats=self._stats
+            ):
                 try:
                     self._on_record(record)
                 except Exception:  # noqa: BLE001
                     LOG.exception("处理 fanotify 记录失败")
 
-    def _close_fd(self) -> None:
-        if self._fd is not None:
+    def _close_all(self) -> None:
+        for group in self._groups:
             try:
-                os.close(self._fd)
+                os.close(group.fd)
             except OSError:
                 pass
-            self._fd = None
+        self._groups = []
 
     def _cleanup(self) -> None:
-        self._close_fd()
+        self._close_all()
 
 
 def probe_fatrace(binary: str = "fatrace") -> dict:

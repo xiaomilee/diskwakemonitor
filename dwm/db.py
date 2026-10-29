@@ -16,7 +16,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .errors import DbError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 嫌疑进程的读取顺序必须和归因排序一致，否则面板第一条就不是「真正的触发者」：
+# pre 组（唤醒前动手的）优先 → 首笔时间最早的优先 → 命中多的优先 → 多盘歧义的靠后
+_SUSPECT_ORDER = (
+    "CASE phase WHEN 'pre' THEN 0 WHEN 'block' THEN 1 ELSE 2 END, "
+    "first_ts ASC, hits DESC, ambiguous ASC"
+)
 
 MIGRATIONS: List[Tuple[int, List[str]]] = [
     (
@@ -93,6 +100,14 @@ MIGRATIONS: List[Tuple[int, List[str]]] = [
             """,
             "CREATE INDEX IF NOT EXISTS idx_power_dev_ts ON power_sample(dev, ts)",
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        ],
+    ),
+    (
+        # v2：归因结果需要区分「多盘歧义」与「块层证据」，旧库就地加列
+        2,
+        [
+            "ALTER TABLE wake_suspect ADD COLUMN ambiguous INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE wake_suspect ADD COLUMN phase TEXT NOT NULL DEFAULT 'pre'",
         ],
     ),
 ]
@@ -331,6 +346,8 @@ class WakeRepo:
                 s.first_ts,
                 s.last_ts,
                 s.sample_path,
+                1 if getattr(s, "ambiguous", False) else 0,
+                getattr(s, "phase", "pre") or "pre",
             )
             for s in suspects
         ]
@@ -340,10 +357,23 @@ class WakeRepo:
             self.conn.executemany(
                 """
                 INSERT INTO wake_suspect(wake_id, pid, comm, cmdline, container, uid,
-                                         hits, first_ts, last_ts, sample_path)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
+                                         hits, first_ts, last_ts, sample_path,
+                                         ambiguous, phase)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 rows,
+            )
+
+    def replace_suspects(self, wake_id: int, suspects: Iterable[Any]) -> None:
+        """整体替换某次唤醒的嫌疑列表（SMART 后到、重跑归因时用）。"""
+        with self.conn:
+            self.conn.execute("DELETE FROM wake_suspect WHERE wake_id=?", (wake_id,))
+        self.add_suspects(wake_id, suspects)
+
+    def set_suspect_count(self, wake_id: int, count: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE wake_event SET suspect_count=? WHERE id=?", (count, wake_id)
             )
 
     def upgrade_confidence(self, wake_id: int, confidence: str, note: str) -> None:
@@ -372,7 +402,7 @@ class WakeRepo:
     def suspects(self, wake_id: int) -> List[sqlite3.Row]:
         return list(
             self.conn.execute(
-                "SELECT * FROM wake_suspect WHERE wake_id=? ORDER BY hits DESC, last_ts DESC",
+                f"SELECT * FROM wake_suspect WHERE wake_id=? ORDER BY {_SUSPECT_ORDER}",
                 (wake_id,),
             )
         )
@@ -384,7 +414,7 @@ class WakeRepo:
         result: Dict[int, List[sqlite3.Row]] = {wid: [] for wid in wake_ids}
         for row in self.conn.execute(
             f"SELECT * FROM wake_suspect WHERE wake_id IN ({placeholders}) "
-            "ORDER BY hits DESC, last_ts DESC",
+            f"ORDER BY {_SUSPECT_ORDER}",
             list(wake_ids),
         ):
             result[row["wake_id"]].append(row)

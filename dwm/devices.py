@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 from .errors import DeviceError
 
 SYS_BLOCK = "/sys/block"
+SYS_FS_BTRFS = "/sys/fs/btrfs"
 PROC_MOUNTS = "/proc/mounts"
 
 # 这些是虚拟/聚合设备，唤醒归因对它们没有意义（真正落在 sd*/nvme* 上）
@@ -122,13 +123,49 @@ def _array_members(name: str, sys_block: str = SYS_BLOCK) -> List[str]:
         return []
 
 
+def _btrfs_member_map(sys_fs_btrfs: str = SYS_FS_BTRFS) -> Dict[str, List[str]]:
+    """btrfs 多设备文件系统的成员关系：整盘名 → 同组所有整盘名。
+
+    物理盘没有 /sys/block/<盘>/slaves，btrfs 的成员关系只在
+    /sys/fs/btrfs/<uuid>/devices/ 下（目录项名就是 sda1 / sdb1 这种设备名）。
+    不做这一步的话，多设备 btrfs 只有 /proc/mounts 里写的那一块能拿到挂载点。
+    """
+    result: Dict[str, List[str]] = {}
+    try:
+        uuids = os.listdir(sys_fs_btrfs)
+    except OSError:
+        return result
+    for uuid in uuids:
+        devices_dir = os.path.join(sys_fs_btrfs, uuid, "devices")
+        try:
+            members = os.listdir(devices_dir)
+        except OSError:
+            continue
+        disks: List[str] = []
+        for member in members:
+            disk = partition_to_disk(member)
+            if disk and disk not in disks:
+                disks.append(disk)
+        if len(disks) < 2:
+            continue
+        for disk in disks:
+            group = result.setdefault(disk, [])
+            for other in disks:
+                if other != disk and other not in group:
+                    group.append(other)
+    return result
+
+
 def read_mounts(
-    *, mounts_file: str = PROC_MOUNTS, sys_block: str = SYS_BLOCK
+    *,
+    mounts_file: str = PROC_MOUNTS,
+    sys_block: str = SYS_BLOCK,
+    sys_fs_btrfs: str = SYS_FS_BTRFS,
 ) -> Dict[str, List[str]]:
     """返回 整盘名 → 挂载点列表。
 
-    关键处理：挂载在阵列（md/dm）上时，把挂载点同时映射到所有成员盘，
-    否则成员盘的 mounts 为空、路径归属会全部失配（fnOS 典型场景）。
+    关键处理：挂载在阵列（md/dm/btrfs 多设备）上时，把挂载点同时映射到所有
+    成员盘，否则成员盘的 mounts 为空、路径归属会全部失配（fnOS 典型场景）。
     """
     mapping: Dict[str, List[str]] = {}
     try:
@@ -139,6 +176,8 @@ def read_mounts(
             f"无法读取 {mounts_file}：{exc}",
             hint="确认在 Linux 上运行（非 Linux 环境无法采集）",
         ) from exc
+
+    btrfs_groups = _btrfs_member_map(sys_fs_btrfs)
 
     for line in lines:
         parts = line.split()
@@ -160,6 +199,9 @@ def read_mounts(
             member_disk = partition_to_disk(member)
             if member_disk and member_disk not in targets:
                 targets.append(member_disk)
+        for sibling in btrfs_groups.get(disk, []):
+            if sibling not in targets:
+                targets.append(sibling)
         for target in targets:
             bucket = mapping.setdefault(target, [])
             if mountpoint not in bucket:
@@ -167,13 +209,14 @@ def read_mounts(
     return mapping
 
 
-def stat_dev_map(devices: Dict[str, BlockDevice]) -> Dict[int, str]:
-    """建立 st_dev → 整盘名 的映射（扫描被监控盘各挂载点）。
+def stat_dev_map(devices: Dict[str, BlockDevice]) -> Dict[int, List[str]]:
+    """建立 st_dev → 整盘名列表 的映射（扫描被监控盘各挂载点）。
 
     作为路径前缀匹配之外的兜底：btrfs/LVM/多设备文件系统上，
     文件的 os.stat(path).st_dev 与挂载点一致，可直接反查归属盘。
+    一个 st_dev 可能对应多块成员盘（md / btrfs 多设备），所以是列表。
     """
-    result: Dict[int, str] = {}
+    result: Dict[int, List[str]] = {}
     for name, device in devices.items():
         if not device.monitored:
             continue
@@ -182,7 +225,9 @@ def stat_dev_map(devices: Dict[str, BlockDevice]) -> Dict[int, str]:
                 st_dev = os.stat(mount).st_dev
             except OSError:
                 continue
-            result.setdefault(st_dev, name)
+            bucket = result.setdefault(st_dev, [])
+            if name not in bucket:
+                bucket.append(name)
     return result
 
 
@@ -248,7 +293,11 @@ def enumerate_devices(
 
 
 class MountResolver:
-    """把文件路径映射到整盘名。最长前缀优先，避免 /mnt/usb 与 /mnt/usb/sub 冲突。"""
+    """把文件路径映射到整盘名。最长前缀优先，避免 /mnt/usb 与 /mnt/usb/sub 冲突。
+
+    一个挂载点可能对应多块成员盘（md / btrfs 多设备），此时返回全部候选 ——
+    只返回先插入的那一块会让另一块的归因环永远是空的。
+    """
 
     def __init__(self, devices: Dict[str, BlockDevice]) -> None:
         pairs = []
@@ -257,22 +306,34 @@ class MountResolver:
                 continue
             for mount in device.mounts:
                 pairs.append((mount.rstrip("/") or "/", name))
-        pairs.sort(key=lambda item: len(item[0]), reverse=True)
+        # 前缀长的优先；长度相同时按盘名排序，保证结果稳定可复现
+        pairs.sort(key=lambda item: (-len(item[0]), item[1]))
         self._pairs = pairs
 
     @property
     def empty(self) -> bool:
         return not self._pairs
 
-    def resolve(self, path: str) -> Optional[str]:
+    def resolve_all(self, path: str) -> List[str]:
+        """返回所有匹配同一最长前缀的整盘名（去重保序）。"""
         if not path or not path.startswith("/"):
-            return None
+            return []
+        matched_len = -1
+        names: List[str] = []
         for prefix, name in self._pairs:
             if prefix == "/":
                 continue
+            if matched_len >= 0 and len(prefix) < matched_len:
+                break  # 已命中更长的前缀，后面的都更短
             if path == prefix or path.startswith(prefix + "/"):
-                return name
-        return None
+                matched_len = len(prefix)
+                if name not in names:
+                    names.append(name)
+        return names
+
+    def resolve(self, path: str) -> Optional[str]:
+        names = self.resolve_all(path)
+        return names[0] if names else None
 
     def mounts_of(self, name: str) -> List[str]:
         return [prefix for prefix, dev in self._pairs if dev == name]

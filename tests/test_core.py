@@ -296,15 +296,18 @@ class TestMountResolver(unittest.TestCase):
 
 
 class TestCorrelator(unittest.TestCase):
-    def test_picks_closest_and_counts_hits(self):
+    def test_picks_earliest_before_wakeup(self):
         correlator = Correlator(
-            ring_buffer_size=1000, lookback_seconds=5.0, lookahead_seconds=3.0
+            ring_buffer_size=1000,
+            lookback_seconds=20.0,
+            lookahead_seconds=3.0,
+            spinup_floor_seconds=2.0,
         )
         wake_ts = 1000.0
-        # 真正的触发者：紧贴唤醒时刻，只碰一次
-        correlator.add("sdb", Sample(ts=wake_ts - 0.2, pid=100, comm="find", path="/mnt/usb1"))
-        # 背景噪音：早就不停写
-        for offset in (4.5, 4.0, 3.5):
+        # 真正的触发者：盘上电要 8 秒，所以它的系统调用落在唤醒观测之前 8 秒
+        correlator.add("sdb", Sample(ts=wake_ts - 8.0, pid=100, comm="find", path="/mnt/usb1"))
+        # 盘转起来之后涌进来的索引/扫描：离「IO 完成」最近，但不是元凶
+        for offset in (0.6, 0.4, 0.2):
             correlator.add(
                 "sdb", Sample(ts=wake_ts - offset, pid=200, comm="rsyslogd", path="/mnt/usb1/a.log")
             )
@@ -312,9 +315,20 @@ class TestCorrelator(unittest.TestCase):
         suspects = correlator.attribute(WakeCandidate(dev="sdb", ts=wake_ts, idle_seconds=900, confidence="state"))
         self.assertEqual(suspects[0].comm, "find")
         self.assertEqual(suspects[0].pid, 100)
+        self.assertEqual(suspects[0].phase, "pre")
+        self.assertEqual(suspects[1].phase, "post")
+
+    def test_trigger_outside_old_window_is_inside_new_one(self):
+        # 5 秒窗口时代的回归点：8 秒前的那次 open 必须能被看到
+        correlator = Correlator(lookback_seconds=20.0, lookahead_seconds=3.0)
+        correlator.add("sdb", Sample(ts=992.0, pid=7, comm="smbd", path="/vol1/f"))
+        suspects = correlator.attribute(
+            WakeCandidate(dev="sdb", ts=1000.0, idle_seconds=900, confidence="state")
+        )
+        self.assertEqual([s.comm for s in suspects], ["smbd"])
 
     def test_window_excludes_far_events(self):
-        correlator = Correlator(lookback_seconds=5.0, lookahead_seconds=3.0)
+        correlator = Correlator(lookback_seconds=20.0, lookahead_seconds=3.0)
         correlator.add("sdb", Sample(ts=100.0, pid=1, comm="old"))
         suspects = correlator.attribute(
             WakeCandidate(dev="sdb", ts=200.0, idle_seconds=900, confidence="state")
@@ -322,13 +336,24 @@ class TestCorrelator(unittest.TestCase):
         self.assertEqual(suspects, [])
 
     def test_lookahead_catches_late_io(self):
-        correlator = Correlator(lookback_seconds=5.0, lookahead_seconds=3.0)
+        correlator = Correlator(lookback_seconds=20.0, lookahead_seconds=3.0)
         correlator.add("sdb", Sample(ts=1002.0, pid=7, comm="smbd", path="/mnt/usb1/f"))
         suspects = correlator.attribute(
             WakeCandidate(dev="sdb", ts=1000.0, idle_seconds=900, confidence="state")
         )
         self.assertEqual(len(suspects), 1)
         self.assertEqual(suspects[0].comm, "smbd")
+
+    def test_ambiguous_samples_rank_lower(self):
+        correlator = Correlator(lookback_seconds=20.0, lookahead_seconds=3.0)
+        correlator.add("sdb", Sample(ts=995.0, pid=1, comm="a", ambiguous=True))
+        correlator.add("sdb", Sample(ts=997.0, pid=2, comm="b"))
+        suspects = correlator.attribute(
+            WakeCandidate(dev="sdb", ts=1000.0, idle_seconds=1, confidence="state")
+        )
+        # 首笔时间是主序，歧义只在同时间档位上做次要排序
+        self.assertEqual([s.comm for s in suspects], ["a", "b"])
+        self.assertTrue(suspects[0].ambiguous)
 
     def test_unknown_device(self):
         correlator = Correlator()
@@ -361,7 +386,13 @@ class TestStorage(unittest.TestCase):
         row = self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()
-        self.assertEqual(row["value"], "1")
+        self.assertEqual(row["value"], str(dbm.SCHEMA_VERSION))
+        # 再跑一次不能报错、也不能把版本号改回去
+        dbm.migrate(self.conn)
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        self.assertEqual(row["value"], str(dbm.SCHEMA_VERSION))
 
     def test_device_upsert_and_read(self):
         repo = dbm.DeviceRepo(self.conn)

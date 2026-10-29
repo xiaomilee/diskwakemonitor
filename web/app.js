@@ -167,18 +167,29 @@
     var sourceCls = '';
     var sourceTitle = '采集进程使用的事件源';
     if (io) {
-      sourceValue = sourceValue + ' · ' + io.seen + ' 事件';
-      if (io.seen === 0) {
+      var seen = io.seen || 0;
+      var kept = io.kept || 0;
+      var noDev = io.no_dev || 0;
+      var notMon = io.not_monitored || 0;
+      var overflow = io.overflow || 0;
+      var suppressed = io.suppressed_active || 0;
+      sourceValue = sourceValue + ' · ' + seen + ' 事件';
+      if (seen === 0) {
         sourceCls = 'warn';
         sourceTitle = '事件源启动后没有产出任何事件——归因会全部为空。' +
           '运行 dwmctl probe 查看 fanotify 是否可用';
-      } else if (io.no_dev > 0 && io.no_dev >= io.kept) {
+      } else if (noDev > 0 && noDev >= kept) {
         sourceCls = 'warn';
-        sourceTitle = '有 ' + io.no_dev + ' 个事件无法归属到被监控盘（已丢弃 ' +
-          io.no_dev + ' / ' + io.seen + '）。多半是挂载映射问题，运行 dwmctl probe 查看挂载点';
+        sourceTitle = '有 ' + noDev + ' 个事件解析不出块设备（已丢弃 ' + noDev + ' / ' +
+          seen + '）。是挂载映射问题，运行 dwmctl probe 查看「挂载点映射」';
+      } else if (overflow > 0) {
+        sourceCls = 'warn';
+        sourceTitle = 'fanotify 队列溢出 ' + overflow + ' 次，事件有丢失：' +
+          '归因可能漏掉真正的触发者。可缩短 lookback 或降低事件量';
       } else {
-        sourceTitle = '已接收 ' + io.seen + ' 个事件，归到被监控盘 ' + io.kept +
-          ' 个，无法归属 ' + io.no_dev + ' 个';
+        sourceTitle = '已接收 ' + seen + ' 个事件，归到被监控盘 ' + kept +
+          ' 个；解析不出设备 ' + noDev + ' 个；设备未监控 ' + notMon + ' 个；' +
+          '队列溢出 ' + overflow + ' 次；因 SMART 报 active 未记为唤醒 ' + suppressed + ' 次';
       }
     }
 
@@ -269,6 +280,11 @@
       meta.appendChild(el('span', 'chip', fmtBytes(dev.size_bytes)));
       if (dev.mounts && dev.mounts.length) {
         meta.appendChild(el('span', 'chip', dev.mounts.join(' ')));
+      } else {
+        var warnChip = el('span', 'chip chip-warn', '无挂载点');
+        warnChip.title = '这块盘没有可用的挂载点：文件级事件无法归属，' +
+          '只能靠块层句柄扫描。运行 dwmctl probe 查看挂载点映射';
+        meta.appendChild(warnChip);
       }
       if (dev.removable) meta.appendChild(el('span', 'chip', '可移动'));
       card.appendChild(meta);
@@ -386,13 +402,17 @@
       var hint;
       if (!collector || collector.source === 'none') {
         hint = '事件源未就绪：请以 root 运行，或执行 dwmctl probe 检查 fanotify 是否可用';
-      } else if (io && io.seen === 0) {
+      } else if (io && (io.seen || 0) === 0) {
         hint = '事件源（' + collector.source + '）启动后没有产出任何访问事件，' +
           '归因会全部为空。执行 dwmctl probe 检查；若 probe 显示正常，' +
           '说明这些唤醒不是文件访问触发的（内核后台任务 / SMART 查询等）';
-      } else if (io && io.no_dev > 0 && io.no_dev >= io.kept) {
+      } else if (io && (io.no_dev || 0) > 0 && (io.no_dev || 0) >= (io.kept || 0)) {
         hint = '已收到 ' + io.seen + ' 个访问事件，但 ' + io.no_dev +
-          ' 个无法归属到被监控盘。多半是挂载映射问题，运行 dwmctl probe 查看各盘挂载点';
+          ' 个解析不出块设备。多半是挂载映射问题，运行 dwmctl probe 查看各盘挂载点';
+      } else if (io && (io.suppressed_active || 0) > 0) {
+        hint = '检测到 ' + io.suppressed_active + ' 次「有 IO 但盘一直是醒的」，已按' +
+          '「阻止休眠」处理、不记为唤醒。看下方「阻止休眠的元凶」；' +
+          '若是硬盘盒不认 smartctl -n standby，把 assume_sleep_on_idle 设为 true';
       } else {
         hint = '盘没有睡下去就不会有唤醒——先在系统设置里开启硬盘休眠，' +
           '或看「阻止休眠的元凶」排行';
@@ -415,6 +435,11 @@
       var proc = el('div', 'proc-cell');
       if (topSuspect) {
         var main = el('div', 'proc-main', topSuspect.comm + '(' + topSuspect.pid + ')');
+        if (topSuspect.phase === 'post') {
+          main.appendChild(el('span', 'tag-phase', '唤醒后涌入'));
+        } else if (topSuspect.phase === 'block') {
+          main.appendChild(el('span', 'tag-phase', '块层证据'));
+        }
         proc.appendChild(main);
         var sub = topSuspect.container || topSuspect.cmdline || '';
         if (sub) proc.appendChild(el('div', 'proc-sub', sub));
@@ -459,6 +484,16 @@
 
         var main = el('div', 'suspect-main');
         var name = el('div', 'suspect-name', s.comm + '(' + s.pid + ')');
+        if (s.phase === 'post') {
+          name.appendChild(el('span', 'tag-phase', '唤醒后涌入'));
+        } else if (s.phase === 'block') {
+          name.appendChild(el('span', 'tag-phase', '块层证据'));
+        }
+        if (s.ambiguous) {
+          var amb = el('span', 'tag-phase', '多盘歧义');
+          amb.title = '这个挂载点对应多块成员盘（md / btrfs），无法确定 IO 落在哪一块';
+          name.appendChild(amb);
+        }
         if (s.container) {
           var tag = el('span', 'tag-container', s.container);
           tag.style.marginLeft = '6px';
@@ -476,8 +511,9 @@
       });
     } else {
       inner.appendChild(el('div', 'detail-note',
-        '归因窗口内没有任何被监控磁盘的访问记录。常见原因：唤醒由内核后台任务（如 btrfs scrub、' +
-        'md 阵列校验）、SMART 查询或硬盘盒固件自身触发，也可能是事件源没有拿到 root 权限。'));
+        '归因窗口（唤醒前 20 秒、唤醒后 3 秒）内没有任何被监控磁盘的文件访问记录，' +
+        '也没扫到持有设备句柄的进程。常见原因：唤醒由内核后台任务（btrfs scrub、' +
+        'md 阵列校验、日志回写）、硬盘盒固件自身触发，或事件源没有拿到 root 权限。'));
     }
 
     td.appendChild(inner);
@@ -602,6 +638,9 @@
       try { data = JSON.parse(event.data); } catch (e) { return; }
       if (data.type === 'wake') {
         toast(data.wake);
+        refresh();
+      } else if (data.type === 'wake_updated') {
+        // SMART 后到并重跑归因命中了嫌疑进程：把那条记录刷新出来
         refresh();
       }
     };

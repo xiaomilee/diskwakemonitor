@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+from .devices import partition_to_disk
+
 STATE_ACTIVE = "active"
 STATE_STANDBY = "standby"
 STATE_UNKNOWN = "unknown"
@@ -30,6 +32,19 @@ STATE_UNKNOWN = "unknown"
 DEVICE_TYPE_FALLBACKS = ("sat", "usbjmicron", "usbsunplus", "sat,12")
 
 _START_STOP_RE = re.compile(r"^\s*4\s+Start_Stop", re.IGNORECASE)
+_STANDBY_RE = re.compile(r"\bSTANDBY\b", re.IGNORECASE)
+
+
+def normalize_dev(dev: str) -> str:
+    """`/dev/sda` → `sda`，`/dev/sdb1` → `sdb`。
+
+    电源态、diskstats、面板、数据库必须用同一套键，否则 last_state 永远查不到值。
+    """
+    if not dev:
+        return ""
+    base = dev.rsplit("/", 1)[-1]
+    return partition_to_disk(base)
+
 
 
 @dataclass
@@ -118,6 +133,16 @@ class SmartReader:
                 raw=combined,
                 device_type=self._device_type.get(dev_path, ""),
             )
+        if rc == 0 and _STANDBY_RE.search(combined):
+            # 部分 USB 桥接盒在待机时仍返回 0，只在输出文本里写 STANDBY。
+            # 只认退出码会把这类盘永久判成 active，进而拦掉所有唤醒记录。
+            return PowerSample(
+                ts=now,
+                dev=dev_path,
+                state=STATE_STANDBY,
+                raw=combined,
+                device_type=self._device_type.get(dev_path, ""),
+            )
         if rc == 0:
             return PowerSample(
                 ts=now,
@@ -143,21 +168,27 @@ class SmartReader:
 
 
 class PowerStateTracker:
-    """记录上次状态，识别 standby → active 跃变与启停计数递增。"""
+    """记录上次状态，识别 standby → active 跃变与启停计数递增。
+
+    键统一用整盘名（`sda`），与 diskstats、面板、数据库保持一致；
+    传进来的 `PowerSample.dev` 是 `/dev/sda`，这里负责归一。
+    """
 
     def __init__(self) -> None:
         self._last_state: Dict[str, str] = {}
         self._last_start_stop: Dict[str, int] = {}
 
     def last_state(self, dev: str) -> str:
-        return self._last_state.get(dev, STATE_UNKNOWN)
+        return self._last_state.get(normalize_dev(dev), STATE_UNKNOWN)
 
     def was_asleep(self, dev: str) -> bool:
-        return self._last_state.get(dev) == STATE_STANDBY
+        return self._last_state.get(normalize_dev(dev)) == STATE_STANDBY
 
     def observe(self, sample: PowerSample) -> Tuple[bool, str]:
         """返回 (是否发生唤醒, 归因说明)。"""
-        dev = sample.dev
+        dev = normalize_dev(sample.dev)
+        if not dev:
+            return False, ""
         previous = self._last_state.get(dev, STATE_UNKNOWN)
         woke = False
         reasons = []

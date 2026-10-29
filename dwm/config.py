@@ -58,6 +58,12 @@ class Config:
     fatrace_filter: str = "OCW"  # O=open R=read W=write C=close-write
     blockdump_fallback: bool = True  # fatrace 不可用时自动启用 block_dump
     blockdump_enabled: bool = False  # 强制启用 block_dump
+    # 内建 fanotify 优先于 fatrace：fatrace 只按挂载点打标记，看不见容器内的
+    # bind mount；内建源用 FAN_MARK_FILESYSTEM 盯整个超级块，容器一样覆盖。
+    prefer_builtin_fanotify: bool = True
+    fanotify_prefer_filesystem: bool = True  # 失败自动退回 FAN_MARK_MOUNT
+    # 归因为空时扫描 /proc/*/fd 看谁持有设备节点（块层访问的唯一线索）
+    fdscan_enabled: bool = True
 
     # ---- 设备选择 ----
     monitor_only_sleepable: bool = True
@@ -65,8 +71,13 @@ class Config:
     exclude_devices: List[str] = field(default_factory=list)
 
     # ---- 归因窗口 ----
-    suspect_lookback_seconds: float = 5.0
+    # 事件打在系统调用入口，扇区增量要等盘转起来、IO 完成才出现。
+    # 机械盘上电 3-15 秒是常态，窗口必须向左留够，否则触发者落在窗口外面。
+    suspect_lookback_seconds: float = 20.0
     suspect_lookahead_seconds: float = 3.0
+    # 唤醒时刻之前这段时间视为「上电期 / 盘转起来之后的涌入」，排序靠后：
+    # 真正的触发者几乎不会落在这里，落在这里的多半是被唤醒后才冲进来的进程。
+    suspect_spinup_floor_seconds: float = 2.0
     dedupe_window_seconds: float = 10.0
     ring_buffer_size: int = 20000
 
@@ -150,6 +161,13 @@ def validate(cfg: Config) -> Config:
         problems.append("ring_buffer_size 不能小于 100")
     if cfg.suspect_lookback_seconds < 0 or cfg.suspect_lookahead_seconds < 0:
         problems.append("归因窗口不能为负数")
+    if cfg.suspect_spinup_floor_seconds < 0:
+        problems.append("suspect_spinup_floor_seconds 不能为负数")
+    if cfg.suspect_spinup_floor_seconds >= cfg.suspect_lookback_seconds:
+        problems.append(
+            f"suspect_spinup_floor_seconds({cfg.suspect_spinup_floor_seconds}) "
+            f"必须小于 suspect_lookback_seconds({cfg.suspect_lookback_seconds})"
+        )
     if cfg.log_level.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         problems.append(f"log_level 非法：{cfg.log_level}")
     for dev in cfg.monitor_devices + cfg.exclude_devices:

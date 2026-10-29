@@ -62,7 +62,7 @@ class TestStatDevMap(unittest.TestCase):
         }
         mapping = stat_dev_map(devices)
         st_dev = os.stat(tmp).st_dev
-        self.assertEqual(mapping.get(st_dev), "sda")
+        self.assertEqual(mapping.get(st_dev), ["sda"])
 
     def test_unreachable_mount_skipped(self):
         devices = {

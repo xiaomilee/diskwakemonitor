@@ -1,5 +1,5 @@
 appname               = diskwakemonitor
-version               = 1.2.0
+version               = 1.3.0
 display_name          = 硬盘唤醒归因
 desc                  = 记录是哪个进程访问了磁盘，查清外接硬盘被什么唤醒。<br>唤醒判定（/proc/diskstats）+ 电源态确认（SMART）+ 进程归因（fatrace），带 Web 面板与命令行。只读诊断，不修改任何数据。
 platform              = x86
@@ -18,4 +18,4 @@ ctl_stop              = true
 desktop_uidir         = ui
 desktop_applaunchname = diskwakemonitor.Application
 
-changelog             = 修复 fnOS 阵列挂载（/dev/md0 或 DM 挂到 /vol*）下访问事件无法归属到成员盘、导致全部唤醒「未捕获到访问事件」的问题：挂载映射现在穿透 md/DM 阵列，并新增 st_dev 兜底归属；新增按盘清除记录：面板磁盘卡片「清除」按钮、`POST /api/clear`、`dwmctl clear --dev sda`；面板新增事件产出统计：数据源显示「已接收/已归属/无法归属」事件数，事件源无产出或映射失败会直接在面板警示，不再静默；唤醒列表为空时的提示按实际故障（源无产出 / 映射失败 / 盘未休眠）区分
+changelog             = 修复归因链路四处稳定落空：电源态键不一致、SMART 另插一条唤醒、fanotify 看不见容器、多成员盘只进第一块的环；修复电源态键：采样存的是 `/dev/sda`，diskstats 与面板查的是 `sda`，导致 `last_state` 永远 `unknown`、面板电源态恒为未知、「盘明明醒着」也拦不住；SMART 只升级最近一次 diskstats 唤醒（回看一个轮询周期），不再用采样时刻另插一条；升级后自动重跑归因并回写嫌疑进程，消除「高置信 + 零嫌疑」；归因窗口改为「唤醒前 20 秒 + 唤醒后 3 秒」，排序改为「唤醒前最早的那笔」，唤醒前 2 秒内（上电期 / 涌入期）的样本单独归类、排在后面 等 11 项

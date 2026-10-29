@@ -20,20 +20,35 @@ SMB 访问、容器里的下载器、定时备份、日志落盘、甚至你自�
 |---|---|---|
 | 唤醒判定 | `/proc/diskstats` 每秒轮询 | 空闲超过阈值后突然出现扇区增量 → 唤醒候选 |
 | 电源确认 | `smartctl -n standby`（不惊醒盘） | 读到 standby→active 跃迁、`Start_Stop_Count` 递增 → 高置信确认 |
-| 归因 | `fatrace` → 内建 `fanotify` → `block_dump` | 拿到「哪个进程碰了哪个文件」 |
+| 归因 | 内建 `fanotify` → `fatrace` → `block_dump` | 拿到「哪个进程碰了哪个文件」 |
 
 归因数据源按优先级自动选择：
 
-1. **fatrace**（装了就用，最省心）
-2. **内建 fanotify**（fatrace 没装时自动顶上）：用 ctypes 直接调 glibc 的
-   `fanotify_init/fanotify_mark`，不依赖任何外部包，精度与 fatrace 相同
-   （pid + 进程名 + 文件路径）。fnOS 这类 Debian 系系统开箱可用
-3. **block_dump**（最后兜底）：仅内核 5.10 以前可用——**5.10 起内核已移除该功能**，
+1. **内建 fanotify（默认）**：用 ctypes 直接调 glibc 的 `fanotify_init/fanotify_mark`，
+   不依赖任何外部包。按**超级块**分组、用 `FAN_MARK_FILESYSTEM` 打标记，
+   容器里的 bind mount 一样能看见，事件天然带设备归属。fnOS 这类 Debian 系开箱可用
+2. **fatrace（备用）**：只有内建源不可用时才用。它按**挂载点**打标记，
+   容器内的访问看不到 —— 在 fnOS 上（应用几乎全是容器）会系统性漏事件
+3. **block_dump（最后兜底）**：仅内核 5.10 以前可用——**5.10 起内核已移除该功能**，
    fnOS 的 6.12 内核上这条链路是死的，只会出现在 `dwmctl probe` 的警告里
 
-唤醒不会立刻定案，而是等 `suspect_lookahead_seconds`（默认 3 秒）走完再归因——
-因为硬盘上电有 1~3 秒延迟，**触发唤醒的那次 IO 往往“看起来晚于”唤醒时刻**。
-窗口内记录按进程聚合，时间最贴近、命中最多的排前面。
+唤醒不会立刻定案，而是等 `suspect_lookahead_seconds`（默认 3 秒）走完再归因。
+时间轴是这样的：**事件打在系统调用入口，扇区增量要等盘转起来、IO 完成才出现**，
+机械盘上电 3~15 秒是常态。所以真正触发者的时间戳落在唤醒观测时刻**之前**，
+而且可能早 10 秒以上 —— 窗口默认向左留 20 秒。
+
+排序取「唤醒之前最早的那一笔」，而不是「离唤醒时刻最近的那一笔」：盘转起来之后
+smbd、索引、扫描会一拥而上，它们的 `last_ts` 离「IO 完成」最近，但都不是元凶。
+唤醒前 2 秒（`suspect_spinup_floor_seconds`）内的样本归入「上电期/涌入期」，
+单独排在后面。
+
+同一挂载点对应多块成员盘（md、btrfs 多设备）时，样本会进每一块盘的归因环，
+并标记「多盘歧义」——路径本身分不出 IO 落在哪一块。
+
+SMART 报出的唤醒**不会另记一条**：它在轮询间隔（默认 60 秒）内只是「确认」，
+会把最近一次 diskstats 唤醒升为最高置信。如果那条记录当时窗口里什么都没有，
+会再把窗口放宽到一个轮询周期重跑一次归因，并在备注里标明「时间点仅供参考」。
+
 
 每条记录带三档置信度：
 
@@ -56,7 +71,7 @@ SMB 访问、容器里的下载器、定时备份、日志落盘、甚至你自�
 
 安装包：
 
-- **直接下载**：<https://github.com/xiaomilee/disk-wake-monitor/releases/latest>
+- **直接下载**：<https://github.com/xiaomilee/diskwakemonitor/releases/latest>
   （每个版本的 Release 附件就是安装包，按版本号选最新的）
 - **自己构建**：`bash tools/build_fpk.sh` → `dist/diskwakemonitor_<版本>_x86.fpk`
 
@@ -175,11 +190,16 @@ dwmctl clear --dev sda       # 清除某块盘的记录（--keep-access 只清�
 | `idle_threshold_seconds` | 120 | 多久无 IO 视为「已休眠」 |
 | `smart_interval` | 60 | SMART 电源态轮询间隔；**别调太短**（见 FAQ） |
 | `assume_sleep_on_idle` | false | USB 盒永远回报 active 时的逃生开关 |
-| `monitor_only_sleepable` | true | 只盯外接/可移动机械盘 |
+| `monitor_only_sleepable` | true | 只监控机械盘（内置 + 外接都算，SSD 跳过） |
 | `monitor_devices` | [] | 强制监控，如 `["sdb"]` |
 | `exclude_devices` | [] | 显式排除 |
+| `prefer_builtin_fanotify` | true | 内建 fanotify 优先于 fatrace（容器场景必须为 true） |
+| `fanotify_prefer_filesystem` | true | 用 `FAN_MARK_FILESYSTEM` 盯整个超级块，失败自动退回挂载点标记 |
+| `fdscan_enabled` | true | 归因为空时扫 `/proc/*/fd` 找谁开着 `/dev/sdX` |
 | `fatrace_filter` | "OCW" | 采集的事件类型（O=open R=read W=write C=close） |
+| `suspect_lookback_seconds` | 20.0 | 归因向前窗口；机械盘上电慢，别调小 |
 | `suspect_lookahead_seconds` | 3.0 | 归因向后窗口 |
+| `suspect_spinup_floor_seconds` | 2.0 | 唤醒前这段视为「上电期/涌入期」，排序靠后 |
 | `log_level` | INFO | 日志级别 |
 
 环境变量同名大写加 `DWM_` 前缀，如 `DWM_MONITOR_DEVICES=sdb,sdc`。
@@ -189,16 +209,24 @@ dwmctl clear --dev sda       # 清除某块盘的记录（--keep-access 只清�
 ## FAQ
 
 **Q：为什么总是「未捕获到归因事件」？**
-按顺序查三件事：
+先看面板「数据源」那一格的四个数，它能直接告诉你是哪一环断了：
 
-1. **面板「数据源」一格**：显示 `源名 · N 事件`。`N=0` 说明事件源根本没产出
-   （fanotify 不可用/未 root），此时先跑 `dwmctl probe`；
-2. **N>0 但未归因也是 0 事件归属**：数据源一格会显示警示——事件收到了但归属不到盘，
-   多半是挂载映射问题（fnOS 经 md/DM 挂到 /vol* 的场景 v1.2.0 已修复，
-   老版本升级后重启一次采集）；
-3. 事件正常产出且归属正常仍无归因：唤醒来自没有文件层痕迹的路径——内核后台任务
-   （btrfs scrub、md 校验、fstrim）、SMART 查询、硬盘盒固件自身。这类唤醒归因
-   本来就没有答案，能确认「不是用户进程干的」本身也是有效信息。
+| 现象 | 断点 | 怎么修 |
+|---|---|---|
+| `事件 0` | 事件源根本没产出 | `dwmctl probe` 看 fanotify 与 root 权限 |
+| `kept` 远小于 `seen`，且「解析不出设备」占多数 | 路径没归到盘 | 看 probe 的「挂载点映射」；`/vol*` 挂载需 md/btrfs 成员可读 |
+| 「设备未监控」很多 | 解析到了系统盘/overlay | 正常现象，只有机械盘被监控 |
+| 「队列溢出」> 0 | 事件太多被内核丢了 | 缩短 lookback，或把 `data_dir` 与业务 IO 错开 |
+| `kept` 正常但仍无归因 | 唤醒没有文件层痕迹 | 见下一条 |
+
+真的没有文件层痕迹时，程序还有两层兜底：扫描谁开着 `/dev/sdX`（块层访问、
+阵列校验、直接开设备节点），以及识别「本工具的 smartctl 查询把盘转醒」。
+备注里会明确写出用的是哪一层证据。
+
+**Q：面板上「因盘活跃未记为唤醒」一直在涨？**
+说明 SMART 报这块盘一直是 `active`，程序按「阻止休眠」处理、不记唤醒。
+如果确认盘确实会睡（硬盘盒不认 `smartctl -n standby`），设
+`"assume_sleep_on_idle": true`，改为纯「久静后 IO」推断。
 
 **Q：SMART 一直读不到 / 状态永远是 active？**
 廉价 USB-SATA 桥接盒常见。程序会自动按 `sat → usbjmicron → usbsunplus` 依次重试；
@@ -226,7 +254,12 @@ dwmctl clear --dev sda       # 清除某块盘的记录（--keep-access 只清�
   来覆盖，极端情况下插入瞬间的前几秒事件可能丢失
 - 归因粒度到进程与容器；SMB/NFS 访问显示为 `smbd`/`nfsd`，远程客户端是谁需要另查
 - RAID（md/dm）设备本身被跳过，唤醒归因落在底层 sd* 盘上
-- 需要root；非 root 时 fanotify 与 block_dump 都不可用
+- 多块盘共用一个挂载点（md raid1/5、btrfs 多设备）时，路径本身分不出 IO 落在哪一块，
+  这类嫌疑会标「多盘歧义」，只能作为线索不能当结论
+- **写操作的时间戳不等于落盘时间**：`write()` 命中页缓存会立刻返回，真正的回写可能
+  几十秒后才发生。所以如果榜首是一次写操作，实际触发者可能是它后排队列的回写，
+  需要结合「阻止休眠的元凶」一起看
+- 需要 root；非 root 时 fanotify 与 block_dump 都不可用
 
 ---
 
@@ -322,9 +355,9 @@ dwm/
   diskstats.py     /proc/diskstats 解析与空闲追踪（唤醒地面真值）
   power.py         smartctl 电源态探测（-n standby 不惊醒盘）与启停计数
   procfs.py        /proc 进程补全：命令行、父进程链、容器识别
-  sources.py       fatrace（JSONL/文本双格式）与 block_dump 事件源
-  correlator.py    双向窗口归因引擎
-  collector.py     采集编排：轮询、队列、去重、落库、优雅停机
+  sources.py       事件源：内建 fanotify（按超级块分组）、fatrace、block_dump
+  correlator.py    双向窗口归因引擎（pre/post 两段排序）
+  collector.py     采集编排：轮询、队列、去重、块层句柄扫描、落库、优雅停机
   server.py        只读 API + SSE + 静态托管（严格 CSP）
   cli.py           dwmctl 命令行
 web/               面板（原生 HTML/CSS/JS，无框架无 CDN）

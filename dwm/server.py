@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import db as dbm
 from .bus import EventBus
 from .config import Config
+from .power import STATE_UNKNOWN
 
 LOG = logging.getLogger("dwm.http")
 
@@ -125,9 +126,11 @@ class ApiApp:
                 name = row["name"]
                 wake_row = last.get(name)
                 power_row = power.get(name)
-                state = live_state.get(name) or (
-                    power_row["state"] if power_row else "unknown"
-                )
+                # "unknown" 是非空字符串，不能用 or 兜底 —— 否则内存里没采到时
+                # 永远盖住数据库里那条真正的 SMART 记录
+                state = live_state.get(name) or ""
+                if not state or state == STATE_UNKNOWN:
+                    state = power_row["state"] if power_row else STATE_UNKNOWN
                 result.append(
                     {
                         "name": name,
@@ -352,6 +355,7 @@ class ApiApp:
 
 
 def _suspect_dict(row) -> Dict[str, Any]:
+    keys = row.keys()
     return {
         "pid": row["pid"],
         "comm": row["comm"],
@@ -362,6 +366,8 @@ def _suspect_dict(row) -> Dict[str, Any]:
         "first_ts": row["first_ts"],
         "last_ts": row["last_ts"],
         "sample_path": row["sample_path"],
+        "ambiguous": bool(row["ambiguous"]) if "ambiguous" in keys else False,
+        "phase": (row["phase"] if "phase" in keys else "pre") or "pre",
     }
 
 
